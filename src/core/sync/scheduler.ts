@@ -1,0 +1,68 @@
+import { LOG } from "@/config/logger.ts";
+import { networkState } from "@/core/state/store.ts";
+import { fetchCouncilTopology } from "./council-fetch.ts";
+import { rescanRollingWindow } from "./soroban-watcher.ts";
+
+const HOURLY_RESYNC_MS = 60 * 60 * 1000;
+const MINUTE_SWEEP_MS = 60 * 1000;
+
+let hourlyTimer: number | null = null;
+let minuteTimer: number | null = null;
+let running = false;
+
+async function hourlyResync(): Promise<void> {
+  try {
+    const topology = await fetchCouncilTopology();
+    networkState.replaceTopology(topology);
+    await rescanRollingWindow();
+    LOG.info("Hourly re-sync complete", {
+      councils: topology.length,
+      providers: networkState.countActiveProviders(),
+      assets: networkState.countAssetsRegistered(),
+    });
+  } catch (err) {
+    LOG.warn("Hourly re-sync failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function minuteSweep(): void {
+  const purged = networkState.sweepWindow();
+  if (purged > 0) {
+    LOG.debug("Minute sweep dropped stale window entries", { purged });
+  }
+}
+
+export function startScheduler(): void {
+  if (running) return;
+  running = true;
+  hourlyTimer = setInterval(
+    () => {
+      hourlyResync().catch((err) => {
+        LOG.error("Hourly re-sync threw", {
+          error: err instanceof Error ? err.message : String(err),
+        });
+      });
+    },
+    HOURLY_RESYNC_MS,
+  ) as unknown as number;
+  minuteTimer = setInterval(minuteSweep, MINUTE_SWEEP_MS) as unknown as number;
+  LOG.info("Scheduler started", {
+    hourlyResyncMs: HOURLY_RESYNC_MS,
+    minuteSweepMs: MINUTE_SWEEP_MS,
+  });
+}
+
+export function stopScheduler(): void {
+  running = false;
+  if (hourlyTimer !== null) {
+    clearInterval(hourlyTimer);
+    hourlyTimer = null;
+  }
+  if (minuteTimer !== null) {
+    clearInterval(minuteTimer);
+    minuteTimer = null;
+  }
+  LOG.info("Scheduler stopped");
+}

@@ -1,0 +1,47 @@
+name: Deploy to Mainnet
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: deploy-mainnet
+  cancel-in-progress: true
+
+env:
+  APP: moonlight-mainnet-network-dashboard
+  REGIONS: ams
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: mainnet
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: superfly/flyctl-actions/setup-flyctl@master
+
+      - name: Deploy to Fly.io
+        run: |
+          if flyctl deploy --config fly.mainnet.toml --remote-only; then
+            echo "Deploy succeeded"
+          else
+            echo "Deploy failed — cleaning up unreachable machines..."
+            flyctl machines list --json -a "$APP" | jq -r '.[] | "\(.id) \(.region) \(.state)"'
+
+            for ID in $(flyctl machines list --json -a "$APP" | jq -r '.[].id'); do
+              echo "  Destroying $ID"
+              flyctl machines destroy "$ID" --force -a "$APP" || true
+            done
+
+            echo "Retrying deploy..."
+            flyctl deploy --config fly.mainnet.toml --remote-only
+          fi
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
+      - name: Capture Fly app logs on failure
+        if: failure()
+        run: flyctl logs -a "$APP" --no-tail
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}

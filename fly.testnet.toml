@@ -1,0 +1,52 @@
+app = 'moonlight-beta-network-dashboard-platform'
+primary_region = 'ams'
+
+[build]
+
+[env]
+  PORT = '8080'
+  MODE = 'production'
+  LOG_LEVEL = 'INFO'
+
+  # Rule: only INFRASTRUCTURE + OPERATIONAL config goes here. There is no
+  # application state in this service — councils/PPs/channels are discovered
+  # at runtime from council-platform + Soroban.
+
+  # STELLAR
+  NETWORK = 'testnet'
+  STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org'
+
+  # OPENTELEMETRY
+  OTEL_DENO = 'true'
+  OTEL_SERVICE_NAME = 'network-dashboard-platform-testnet'
+  OTEL_EXPORTER_OTLP_PROTOCOL = 'http/protobuf'
+  # OTEL_EXPORTER_OTLP_ENDPOINT and OTEL_EXPORTER_OTLP_HEADERS set in fly.io secrets
+
+  # SERVICE
+  # SERVICE_DOMAIN, COUNCIL_PLATFORM_URL, ALLOWED_ORIGINS set in fly.io env secrets
+
+[processes]
+  app = 'deno task serve'
+
+[http_service]
+  internal_port = 8080
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 1
+  processes = ['app']
+
+  [[http_service.checks]]
+    interval = "5s"
+    timeout = "3s"
+    grace_period = "60s"
+    method = "GET"
+    path = "/api/v1/health"
+
+[deploy]
+  strategy = "bluegreen"
+
+[[vm]]
+  memory = '512mb'
+  cpu_kind = 'shared'
+  cpus = 1
