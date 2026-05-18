@@ -24,6 +24,8 @@ export class NetworkStateStore {
   private assetContractToCouncil = new Map<string, string>();
   /** channelContractId → councilId for deposit/settlement linkage. */
   private channelContractToCouncil = new Map<string, string>();
+  /** providerPublicKey → councilId for channel_bundle attribution. */
+  private providerToCouncil = new Map<string, string>();
   /** Ring buffer of most-recent events for the activity feed. */
   private recent: NetworkEvent[] = [];
   /** Sliding 24h timestamps for the EVENTS/24h counter. */
@@ -40,6 +42,7 @@ export class NetworkStateStore {
     this.councils.clear();
     this.assetContractToCouncil.clear();
     this.channelContractToCouncil.clear();
+    this.providerToCouncil.clear();
     for (const e of entries) {
       this.councils.set(e.id, e);
       for (const c of e.channels) {
@@ -47,6 +50,9 @@ export class NetworkStateStore {
         if (c.assetContractId) {
           this.assetContractToCouncil.set(c.assetContractId, e.id);
         }
+      }
+      for (const p of e.providers) {
+        this.providerToCouncil.set(p.publicKey, e.id);
       }
     }
   }
@@ -77,6 +83,10 @@ export class NetworkStateStore {
 
   resolveAssetToCouncil(assetContractId: string): string | undefined {
     return this.assetContractToCouncil.get(assetContractId);
+  }
+
+  resolveProviderToCouncil(publicKey: string): string | undefined {
+    return this.providerToCouncil.get(publicKey);
   }
 
   topologySnapshot(): CouncilTopologyEntry[] {
@@ -165,6 +175,7 @@ export class NetworkStateStore {
     this.councils.clear();
     this.assetContractToCouncil.clear();
     this.channelContractToCouncil.clear();
+    this.providerToCouncil.clear();
     this.recent = [];
     this.windowEvents = [];
   }

@@ -14,6 +14,8 @@ export type RawChainEvent = {
   topics: xdr.ScVal[];
   /** The event value (also a ScVal). */
   value: xdr.ScVal;
+  /** Soroban transaction hash — used to dedupe per-tx fee fan-out. */
+  txHash: string;
 };
 
 const COUNCIL_TOPICS = new Set([
@@ -23,6 +25,13 @@ const COUNCIL_TOPICS = new Set([
 ]);
 
 const SAC_TRANSFER_TOPIC = "transfer";
+/**
+ * SAC `fee` events fire once per bundle execution and the `from` topic
+ * carries the executing PP's address. Used to surface bundle activity on
+ * the dashboard without compromising the privacy of the internal sender
+ * and receiver.
+ */
+const SAC_FEE_TOPIC = "fee";
 
 function decodeSymbol(val: xdr.ScVal): string | null {
   return val.switch().name === "scvSymbol" ? val.sym().toString() : null;
@@ -68,7 +77,34 @@ export function mapChainEvent(
   if (topicSymbol === SAC_TRANSFER_TOPIC) {
     return mapSacTransferEvent(raw, now);
   }
+  if (topicSymbol === SAC_FEE_TOPIC) {
+    return mapSacFeeEvent(raw, now);
+  }
   return null;
+}
+
+/**
+ * SAC fee events fire on every bundle execution. We surface them as
+ * `channel_bundle` only when the payer is a known PP and the SAC is
+ * registered against the same council — that filters out unrelated fee
+ * activity (admin/friendbot/etc.).
+ */
+function mapSacFeeEvent(raw: RawChainEvent, now: Date): NetworkEvent | null {
+  if (raw.topics.length < 2) return null;
+  const payer = decodeAddress(raw.topics[1]);
+  if (!payer) return null;
+  const sacCouncilId = networkState.resolveAssetToCouncil(raw.contractId);
+  if (!sacCouncilId) return null;
+  const ppCouncilId = networkState.resolveProviderToCouncil(payer);
+  if (ppCouncilId !== sacCouncilId) return null;
+  return makeEvent(
+    "channel_bundle",
+    sacCouncilId,
+    networkState.getCouncilName(sacCouncilId),
+    raw,
+    now,
+    { providerPublicKey: payer, assetContractId: raw.contractId },
+  );
 }
 
 function mapCouncilEvent(

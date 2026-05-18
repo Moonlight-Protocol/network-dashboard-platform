@@ -13,6 +13,7 @@ export const NETWORK_EVENT_KINDS = [
   "asset_registered",
   "channel_deposit",
   "channel_settlement",
+  "channel_bundle",
 ] as const;
 
 export type NetworkEventKind = typeof NETWORK_EVENT_KINDS[number];
