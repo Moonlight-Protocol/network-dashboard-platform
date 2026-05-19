@@ -40,6 +40,39 @@ jobs:
         env:
           FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
 
+      - name: Ensure exactly one machine per region
+        run: |
+          MACHINES=$(flyctl machines list --json -a "$APP")
+          echo "Current machines:"
+          echo "$MACHINES" | jq -r '.[] | "  \(.id) \(.region) \(.state)"'
+
+          for REGION in $REGIONS; do
+            IDS=$(echo "$MACHINES" | jq -r "[.[] | select(.region == \"$REGION\")] | sort_by(.created_at) | .[].id")
+            COUNT=$(echo "$IDS" | grep -c . || true)
+
+            if [ "$COUNT" -eq 0 ]; then
+              SOURCE=$(echo "$MACHINES" | jq -r '[.[] | select(.state == "started")][0].id')
+              echo "No machine in $REGION — cloning $SOURCE"
+              flyctl machines clone "$SOURCE" --region "$REGION" -a "$APP"
+            elif [ "$COUNT" -gt 1 ]; then
+              echo "Region $REGION has $COUNT machines — keeping newest, destroying extras"
+              KEEP=$(echo "$IDS" | tail -1)
+              for ID in $IDS; do
+                if [ "$ID" != "$KEEP" ]; then
+                  echo "  Destroying $ID"
+                  flyctl machines destroy "$ID" --force -a "$APP" || true
+                fi
+              done
+            else
+              echo "Region $REGION: OK"
+            fi
+          done
+
+          echo "Final state:"
+          flyctl machines list -a "$APP"
+        env:
+          FLY_API_TOKEN: ${{ secrets.FLY_API_TOKEN }}
+
       - name: Capture Fly app logs on failure
         if: failure()
         run: flyctl logs -a "$APP" --no-tail
