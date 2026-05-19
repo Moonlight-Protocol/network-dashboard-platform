@@ -1,6 +1,10 @@
 import type {
+  AssetBreakdownRow,
+  CouncilRollingMetrics,
   CouncilTopologyEntry,
   NetworkEvent,
+  NetworkEventKind,
+  Sparklines,
 } from "@/core/events/types.ts";
 
 /**
@@ -11,12 +15,60 @@ import type {
  * store; WS handlers only read. Methods return shallow clones (or
  * snapshot-shaped objects) so consumers never accidentally mutate
  * internal arrays.
+ *
+ * The store also keeps a derived per-event metric record (amount, asset,
+ * latency) covering the trailing 24h so the snapshot builder can compute
+ * throughput / latency / sparklines / asset breakdown / per-council
+ * rolling totals without holding parallel bucket structures.
  */
 
 const RING_BUFFER_SIZE = 20;
 const ROLLING_WINDOW_MS = 24 * 60 * 60 * 1000;
+const HOUR_MS = 60 * 60 * 1000;
+const MINUTE_MS = 60 * 1000;
+const THROUGHPUT_WINDOW_MS = MINUTE_MS;
+const LATENCY_WINDOW_MS = 5 * MINUTE_MS;
+const SPARKLINE_BUCKETS = 60;
 
-type EventsAt = { id: string; occurredAt: number };
+type MetricEvent = {
+  id: string;
+  occurredAt: number;
+  kind: NetworkEventKind;
+  councilId: string;
+  assetContractId: string | null;
+  amountStroops: bigint | null;
+  latencyMs: number | null;
+};
+
+/**
+ * Parse a decoded amount string back to bigint stroops.
+ * `decodeI128` returns either a plain decimal string (when the high
+ * 64 bits are zero — the common case for normal asset amounts) or
+ * `<hi>:<lo>` for true 128-bit values. Only the plain form is sortable
+ * arithmetic; the colon form is dropped from metric aggregates but kept
+ * in the wire payload for display.
+ */
+function parseAmount(raw: unknown): bigint | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  if (!/^-?\d+$/.test(raw)) return null;
+  try {
+    return BigInt(raw);
+  } catch {
+    return null;
+  }
+}
+
+function readPayload(event: NetworkEvent): {
+  assetContractId: string | null;
+  amountStroops: bigint | null;
+} {
+  const p = event.payload;
+  const assetContractId = typeof p.assetContractId === "string"
+    ? p.assetContractId
+    : null;
+  const amountStroops = parseAmount(p.amount);
+  return { assetContractId, amountStroops };
+}
 
 export class NetworkStateStore {
   private councils = new Map<string, CouncilTopologyEntry>();
@@ -24,12 +76,17 @@ export class NetworkStateStore {
   private assetContractToCouncil = new Map<string, string>();
   /** channelContractId → councilId for deposit/settlement linkage. */
   private channelContractToCouncil = new Map<string, string>();
+  /** assetContractId → assetCode (XLM, USDC, …) for asset breakdown labels. */
+  private assetCodeByContract = new Map<string, string>();
   /** providerPublicKey → councilId for channel_bundle attribution. */
   private providerToCouncil = new Map<string, string>();
   /** Ring buffer of most-recent events for the activity feed. */
   private recent: NetworkEvent[] = [];
-  /** Sliding 24h timestamps for the EVENTS/24h counter. */
-  private windowEvents: EventsAt[] = [];
+  /**
+   * Sliding 24h metric records (one per event observed within the window).
+   * Newest at the end; the cold-start scan seeds in chronological order.
+   */
+  private metrics: MetricEvent[] = [];
 
   // ── council topology ───────────────────────────────────────────────
 
@@ -42,6 +99,7 @@ export class NetworkStateStore {
     this.councils.clear();
     this.assetContractToCouncil.clear();
     this.channelContractToCouncil.clear();
+    this.assetCodeByContract.clear();
     this.providerToCouncil.clear();
     for (const e of entries) {
       this.councils.set(e.id, e);
@@ -49,6 +107,7 @@ export class NetworkStateStore {
         this.channelContractToCouncil.set(c.contractId, e.id);
         if (c.assetContractId) {
           this.assetContractToCouncil.set(c.assetContractId, e.id);
+          this.assetCodeByContract.set(c.assetContractId, c.assetCode);
         }
       }
       for (const p of e.providers) {
@@ -102,10 +161,12 @@ export class NetworkStateStore {
 
   /**
    * Record an observed event: push to the ring buffer (newest first),
-   * trim to capacity, and add to the rolling 24h counter window. Idempotent
-   * by event id — re-publishing the same event id is a no-op.
+   * trim to capacity, and append a metric record for the rolling window.
+   * Idempotent by event id — re-publishing the same event id is a no-op.
+   * `latencyMs` is the wall-clock observation delay vs the chain ledger
+   * close time; pass null when the watcher couldn't determine it.
    */
-  recordEvent(event: NetworkEvent): boolean {
+  recordEvent(event: NetworkEvent, latencyMs: number | null = null): boolean {
     if (this.recent.some((e) => e.id === event.id)) {
       return false;
     }
@@ -116,27 +177,48 @@ export class NetworkStateStore {
 
     const occurredMs = Date.parse(event.occurredAt);
     if (!Number.isNaN(occurredMs)) {
-      this.windowEvents.push({ id: event.id, occurredAt: occurredMs });
+      const { assetContractId, amountStroops } = readPayload(event);
+      this.metrics.push({
+        id: event.id,
+        occurredAt: occurredMs,
+        kind: event.kind,
+        councilId: event.councilId,
+        assetContractId,
+        amountStroops,
+        latencyMs,
+      });
     }
     return true;
   }
 
-  /** Drop windowEvents older than 24h. Called by the minute-sweep. */
+  /** Drop metric records older than 24h. Called by the minute-sweep. */
   sweepWindow(now: number = Date.now()): number {
     const cutoff = now - ROLLING_WINDOW_MS;
-    const before = this.windowEvents.length;
-    this.windowEvents = this.windowEvents.filter((e) => e.occurredAt >= cutoff);
-    return before - this.windowEvents.length;
+    const before = this.metrics.length;
+    this.metrics = this.metrics.filter((m) => m.occurredAt >= cutoff);
+    return before - this.metrics.length;
   }
 
-  /** Replace the rolling window wholesale (used by the 24h cold-start scan). */
+  /**
+   * Replace the rolling window wholesale (used by the 24h cold-start scan).
+   * Each entry's amount + asset are extracted from its NetworkEvent payload.
+   * Latency is unknown for back-fill, so latencyMs is left null.
+   */
   seedWindow(events: NetworkEvent[]): void {
-    this.windowEvents = [];
+    this.metrics = [];
     for (const e of events) {
       const ts = Date.parse(e.occurredAt);
-      if (!Number.isNaN(ts)) {
-        this.windowEvents.push({ id: e.id, occurredAt: ts });
-      }
+      if (Number.isNaN(ts)) continue;
+      const { assetContractId, amountStroops } = readPayload(e);
+      this.metrics.push({
+        id: e.id,
+        occurredAt: ts,
+        kind: e.kind,
+        councilId: e.councilId,
+        assetContractId,
+        amountStroops,
+        latencyMs: null,
+      });
     }
   }
 
@@ -152,8 +234,8 @@ export class NetworkStateStore {
   countEventsLast24h(now: number = Date.now()): number {
     const cutoff = now - ROLLING_WINDOW_MS;
     let n = 0;
-    for (const e of this.windowEvents) {
-      if (e.occurredAt >= cutoff) n++;
+    for (const m of this.metrics) {
+      if (m.occurredAt >= cutoff) n++;
     }
     return n;
   }
@@ -170,19 +252,178 @@ export class NetworkStateStore {
     return this.assetContractToCouncil.size;
   }
 
+  /** Network-wide event count over the trailing 60s. */
+  throughputPerMin(now: number = Date.now()): number {
+    const cutoff = now - THROUGHPUT_WINDOW_MS;
+    let n = 0;
+    for (const m of this.metrics) {
+      if (m.occurredAt >= cutoff) n++;
+    }
+    return n;
+  }
+
+  /**
+   * Average observed latency (ms) over the trailing 5 min, considering
+   * only events that carry a non-null latency sample. Returns null when
+   * no samples are in window — back-fill records have null latency, so
+   * a freshly-booted service correctly reports "no samples" instead of 0.
+   */
+  avgLatencyMs(now: number = Date.now()): number | null {
+    const cutoff = now - LATENCY_WINDOW_MS;
+    let sum = 0;
+    let count = 0;
+    for (const m of this.metrics) {
+      if (m.occurredAt < cutoff) continue;
+      if (m.latencyMs === null) continue;
+      sum += m.latencyMs;
+      count++;
+    }
+    if (count === 0) return null;
+    return Math.round(sum / count);
+  }
+
+  /**
+   * Build 60-minute rolling sparklines: throughput (count/min), latency
+   * (avg ms/min, or null where no samples), volume (sum of deposit +
+   * settlement amounts in whole-asset units, stroops / 1e7, per minute).
+   */
+  sparklines(now: number = Date.now()): Sparklines {
+    // Bucket [0] covers (now - 60m, now - 59m]; bucket [59] covers
+    // (now - 1m, now]. Aligning `start` to (SPARKLINE_BUCKETS - 1)
+    // minutes ago means an event at exactly `now` lands in the
+    // last bucket and an event one full minute earlier lands in
+    // the bucket before it, matching how the SPA renders the line.
+    const start = now - (SPARKLINE_BUCKETS - 1) * MINUTE_MS;
+    const throughput = new Array<number>(SPARKLINE_BUCKETS).fill(0);
+    const volumeStroops = new Array<bigint>(SPARKLINE_BUCKETS).fill(0n);
+    const latencySum = new Array<number>(SPARKLINE_BUCKETS).fill(0);
+    const latencyCount = new Array<number>(SPARKLINE_BUCKETS).fill(0);
+
+    for (const m of this.metrics) {
+      const idx = Math.floor((m.occurredAt - start) / MINUTE_MS);
+      if (idx < 0 || idx >= SPARKLINE_BUCKETS) continue;
+      throughput[idx]++;
+      if (
+        m.amountStroops !== null &&
+        (m.kind === "channel_deposit" || m.kind === "channel_settlement")
+      ) {
+        volumeStroops[idx] += m.amountStroops;
+      }
+      if (m.latencyMs !== null) {
+        latencySum[idx] += m.latencyMs;
+        latencyCount[idx]++;
+      }
+    }
+
+    const latency = latencyCount.map((c, i) =>
+      c > 0 ? Math.round(latencySum[i] / c) : null
+    );
+    // Stroops → whole units (1e7 stroops per 1.0 asset). Sparkline values
+    // are display-only so the lossy Number conversion is fine.
+    const volume = volumeStroops.map((s) =>
+      Number(s / 10_000_000n) + Number(s % 10_000_000n) / 10_000_000
+    );
+    return { throughput, latency, volume };
+  }
+
+  /**
+   * Per-asset volume settled (deposit + settlement) over the trailing 24h,
+   * sorted by share descending. Stroop totals stay exact (string-encoded).
+   */
+  assetBreakdown24h(now: number = Date.now()): AssetBreakdownRow[] {
+    const cutoff = now - ROLLING_WINDOW_MS;
+    const totals = new Map<string, bigint>();
+    for (const m of this.metrics) {
+      if (m.occurredAt < cutoff) continue;
+      if (m.assetContractId === null) continue;
+      if (m.amountStroops === null) continue;
+      if (m.kind !== "channel_deposit" && m.kind !== "channel_settlement") {
+        continue;
+      }
+      const prev = totals.get(m.assetContractId) ?? 0n;
+      totals.set(m.assetContractId, prev + m.amountStroops);
+    }
+    let grand = 0n;
+    for (const v of totals.values()) grand += v;
+    const rows: AssetBreakdownRow[] = [];
+    for (const [assetContractId, amount] of totals) {
+      const code = this.assetCodeByContract.get(assetContractId) ?? "???";
+      const percent = grand > 0n ? Number((amount * 10_000n) / grand) / 100 : 0;
+      rows.push({
+        assetContractId,
+        assetCode: code,
+        amountStroops: amount.toString(),
+        percent,
+      });
+    }
+    rows.sort((a, b) => b.percent - a.percent);
+    return rows;
+  }
+
+  /**
+   * Per-council rolling metrics for the trailing 1 hour. Every known
+   * council appears in the result map, even with all zeroes, so the SPA
+   * can render the panel for any council without a missing-key check.
+   */
+  councilRollingMetrics(
+    now: number = Date.now(),
+  ): Record<string, CouncilRollingMetrics> {
+    const cutoff = now - HOUR_MS;
+    const eventCounts = new Map<string, number>();
+    const bundleCounts = new Map<string, number>();
+    const depositTotals = new Map<string, bigint>();
+    const settlementTotals = new Map<string, bigint>();
+
+    for (const m of this.metrics) {
+      if (m.occurredAt < cutoff) continue;
+      eventCounts.set(m.councilId, (eventCounts.get(m.councilId) ?? 0) + 1);
+      if (m.kind === "channel_bundle") {
+        bundleCounts.set(m.councilId, (bundleCounts.get(m.councilId) ?? 0) + 1);
+      }
+      if (m.amountStroops === null) continue;
+      if (m.kind === "channel_deposit") {
+        depositTotals.set(
+          m.councilId,
+          (depositTotals.get(m.councilId) ?? 0n) + m.amountStroops,
+        );
+      } else if (m.kind === "channel_settlement") {
+        settlementTotals.set(
+          m.councilId,
+          (settlementTotals.get(m.councilId) ?? 0n) + m.amountStroops,
+        );
+      }
+    }
+
+    const out: Record<string, CouncilRollingMetrics> = {};
+    for (const id of this.councils.keys()) {
+      const total = eventCounts.get(id) ?? 0;
+      out[id] = {
+        bundlesLastHour: bundleCounts.get(id) ?? 0,
+        eventsLastHour: total,
+        ratePerMin: Math.round((total / 60) * 10) / 10,
+        depositVolumeStroops: (depositTotals.get(id) ?? 0n).toString(),
+        settlementVolumeStroops: (settlementTotals.get(id) ?? 0n).toString(),
+      };
+    }
+    return out;
+  }
+
   /** Test-only seam to reset all state. */
   __resetForTests(): void {
     this.councils.clear();
     this.assetContractToCouncil.clear();
     this.channelContractToCouncil.clear();
+    this.assetCodeByContract.clear();
     this.providerToCouncil.clear();
     this.recent = [];
-    this.windowEvents = [];
+    this.metrics = [];
   }
 }
 
 export const RING_BUFFER_CAPACITY = RING_BUFFER_SIZE;
 export const ROLLING_WINDOW_DURATION_MS = ROLLING_WINDOW_MS;
+export const SPARKLINE_BUCKET_COUNT = SPARKLINE_BUCKETS;
+export const SPARKLINE_BUCKET_MS = MINUTE_MS;
 
 /** Process-wide singleton. */
 export const networkState = new NetworkStateStore();

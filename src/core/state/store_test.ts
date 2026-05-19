@@ -3,6 +3,7 @@ import {
   NetworkStateStore,
   RING_BUFFER_CAPACITY,
   ROLLING_WINDOW_DURATION_MS,
+  SPARKLINE_BUCKET_COUNT,
 } from "./store.ts";
 import type {
   CouncilTopologyEntry,
@@ -17,7 +18,9 @@ function makeStore() {
 
 function council(
   id: string,
-  channels: Array<{ contractId: string; assetContractId?: string | null }> = [],
+  channels: Array<
+    { contractId: string; assetContractId?: string | null; assetCode?: string }
+  > = [],
   providers: string[] = [],
 ): CouncilTopologyEntry {
   return {
@@ -26,7 +29,7 @@ function council(
     providers: providers.map((p) => ({ publicKey: p, label: null })),
     channels: channels.map((c) => ({
       contractId: c.contractId,
-      assetCode: "XLM",
+      assetCode: c.assetCode ?? "XLM",
       assetContractId: c.assetContractId ?? null,
     })),
     jurisdictions: [],
@@ -37,15 +40,17 @@ function event(
   id: string,
   kind: NetworkEvent["kind"] = "provider_added",
   offsetMs = 0,
+  payload: Record<string, unknown> = {},
+  councilId = "COUNCIL",
 ): NetworkEvent {
   return {
     id,
     kind,
-    councilId: "COUNCIL",
+    councilId,
     councilName: "Council",
     ledger: 1,
     occurredAt: new Date(Date.now() - offsetMs).toISOString(),
-    payload: {},
+    payload,
   };
 }
 
@@ -121,4 +126,124 @@ Deno.test("seedRecent caps at RING_BUFFER_CAPACITY", () => {
   );
   s.seedRecent(events);
   assertEquals(s.recentEvents().length, RING_BUFFER_CAPACITY);
+});
+
+Deno.test("throughputPerMin counts only events within the trailing 60s", () => {
+  const s = makeStore();
+  s.recordEvent(event("a", "provider_added", 0));
+  s.recordEvent(event("b", "provider_added", 30_000));
+  s.recordEvent(event("old", "provider_added", 70_000));
+  assertEquals(s.throughputPerMin(), 2);
+});
+
+Deno.test("avgLatencyMs averages live samples, null when none in window", () => {
+  const s = makeStore();
+  assertEquals(s.avgLatencyMs(), null);
+  s.recordEvent(event("a", "provider_added", 30_000), 100);
+  s.recordEvent(event("b", "provider_added", 60_000), 300);
+  // Back-fill (latency null) doesn't pollute the average.
+  s.recordEvent(event("c", "provider_added", 90_000), null);
+  assertEquals(s.avgLatencyMs(), 200);
+});
+
+Deno.test("sparklines return 60 buckets, count events in the right bucket", () => {
+  const s = makeStore();
+  const now = Date.now();
+  s.recordEvent(event("a", "provider_added", 0));
+  s.recordEvent(event("b", "provider_added", 60_000));
+  s.recordEvent(event("c", "provider_added", 60_000));
+  // Out-of-window event must not contribute.
+  s.recordEvent(event("old", "provider_added", 70 * 60_000));
+  const sp = s.sparklines(now);
+  assertEquals(sp.throughput.length, SPARKLINE_BUCKET_COUNT);
+  // Most recent bucket holds the now-event; previous bucket holds the two
+  // events offset by 60s.
+  assertEquals(sp.throughput[SPARKLINE_BUCKET_COUNT - 1], 1);
+  assertEquals(sp.throughput[SPARKLINE_BUCKET_COUNT - 2], 2);
+  assertEquals(sp.volume[SPARKLINE_BUCKET_COUNT - 1], 0);
+});
+
+Deno.test("sparklines volume sums deposit + settlement amounts in whole units", () => {
+  const s = makeStore();
+  s.replaceTopology([
+    council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }]),
+  ]);
+  s.recordEvent(
+    event("d", "channel_deposit", 0, {
+      channelContractId: "CH1",
+      assetContractId: "SAC1",
+      amount: "15000000", // 1.5 in whole units
+    }, "CA"),
+  );
+  s.recordEvent(
+    event("s", "channel_settlement", 0, {
+      channelContractId: "CH1",
+      assetContractId: "SAC1",
+      amount: "5000000", // 0.5 in whole units
+    }, "CA"),
+  );
+  const sp = s.sparklines();
+  assertEquals(sp.volume[SPARKLINE_BUCKET_COUNT - 1], 2);
+});
+
+Deno.test("assetBreakdown24h aggregates per-asset and sorts by percent", () => {
+  const s = makeStore();
+  s.replaceTopology([
+    council("CA", [
+      { contractId: "CH1", assetContractId: "SAC_XLM", assetCode: "XLM" },
+      { contractId: "CH2", assetContractId: "SAC_USDC", assetCode: "USDC" },
+    ]),
+  ]);
+  s.recordEvent(
+    event("d1", "channel_deposit", 0, {
+      channelContractId: "CH1",
+      assetContractId: "SAC_XLM",
+      amount: "300",
+    }, "CA"),
+  );
+  s.recordEvent(
+    event("d2", "channel_deposit", 0, {
+      channelContractId: "CH1",
+      assetContractId: "SAC_XLM",
+      amount: "300",
+    }, "CA"),
+  );
+  s.recordEvent(
+    event("d3", "channel_deposit", 0, {
+      channelContractId: "CH2",
+      assetContractId: "SAC_USDC",
+      amount: "400",
+    }, "CA"),
+  );
+  const rows = s.assetBreakdown24h();
+  assertEquals(rows.length, 2);
+  assertEquals(rows[0].assetCode, "XLM");
+  assertEquals(rows[0].amountStroops, "600");
+  assertEquals(rows[0].percent, 60);
+  assertEquals(rows[1].assetCode, "USDC");
+  assertEquals(rows[1].percent, 40);
+});
+
+Deno.test("councilRollingMetrics returns zero rows for known but quiet councils", () => {
+  const s = makeStore();
+  s.replaceTopology([
+    council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }]),
+    council("CB"),
+  ]);
+  s.recordEvent(
+    event("d", "channel_deposit", 0, {
+      channelContractId: "CH1",
+      assetContractId: "SAC1",
+      amount: "1000",
+    }, "CA"),
+  );
+  s.recordEvent(event("b", "channel_bundle", 0, {}, "CA"));
+  const rolling = s.councilRollingMetrics();
+  assertEquals(rolling["CA"].bundlesLastHour, 1);
+  assertEquals(rolling["CA"].depositVolumeStroops, "1000");
+  assertEquals(rolling["CA"].settlementVolumeStroops, "0");
+  assertEquals(rolling["CA"].eventsLastHour, 2);
+  // Unknown councils don't appear, quiet known councils still do.
+  assertEquals(rolling["CB"].bundlesLastHour, 0);
+  assertEquals(rolling["CB"].eventsLastHour, 0);
 });

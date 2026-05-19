@@ -37,9 +37,15 @@ function watchedContractIds(): string[] {
   return Array.from(ids);
 }
 
-function publish(event: ReturnType<typeof mapChainEvent>): void {
+function publish(
+  event: ReturnType<typeof mapChainEvent>,
+  ledgerClosedAtMs: number | null,
+): void {
   if (!event) return;
-  const wasNew = networkState.recordEvent(event);
+  const latencyMs = ledgerClosedAtMs === null
+    ? null
+    : Math.max(0, Date.now() - ledgerClosedAtMs);
+  const wasNew = networkState.recordEvent(event, latencyMs);
   if (!wasNew) return;
   networkEventBus.publish(event);
 }
@@ -55,13 +61,13 @@ function publish(event: ReturnType<typeof mapChainEvent>): void {
  *
  * Returns events in their original ledger order.
  */
-function processRawEventBatch(
-  raws: RawChainEvent[],
-): Array<NonNullable<ReturnType<typeof mapChainEvent>>> {
-  const byTx = new Map<
-    string,
-    Array<NonNullable<ReturnType<typeof mapChainEvent>>>
-  >();
+type ProcessedEvent = {
+  event: NonNullable<ReturnType<typeof mapChainEvent>>;
+  ledgerClosedAtMs: number | null;
+};
+
+function processRawEventBatch(raws: RawChainEvent[]): ProcessedEvent[] {
+  const byTx = new Map<string, ProcessedEvent[]>();
   const txOrder: string[] = [];
   for (const raw of raws) {
     const mapped = mapChainEvent(raw);
@@ -72,23 +78,27 @@ function processRawEventBatch(
       txOrder.push(key);
     }
     const bucket = byTx.get(key);
-    if (bucket) bucket.push(mapped);
+    if (bucket) {
+      bucket.push({ event: mapped, ledgerClosedAtMs: raw.ledgerClosedAtMs });
+    }
   }
-  const out: Array<NonNullable<ReturnType<typeof mapChainEvent>>> = [];
+  const out: ProcessedEvent[] = [];
   for (const key of txOrder) {
-    const events = byTx.get(key);
-    if (!events) continue;
-    const hasMoneyFlow = events.some(
-      (e) => e.kind === "channel_deposit" || e.kind === "channel_settlement",
+    const entries = byTx.get(key);
+    if (!entries) continue;
+    const hasMoneyFlow = entries.some(
+      (p) =>
+        p.event.kind === "channel_deposit" ||
+        p.event.kind === "channel_settlement",
     );
     let bundleEmitted = false;
-    for (const e of events) {
-      if (e.kind === "channel_bundle") {
+    for (const p of entries) {
+      if (p.event.kind === "channel_bundle") {
         if (hasMoneyFlow) continue;
         if (bundleEmitted) continue;
         bundleEmitted = true;
       }
-      out.push(e);
+      out.push(p);
     }
   }
   return out;
@@ -106,6 +116,16 @@ function describeErr(err: unknown): string {
   } catch {
     return String(err);
   }
+}
+
+/**
+ * Parse Soroban's `ledgerClosedAt` (ISO string) to ms-since-epoch. Older
+ * SDK responses may omit it; in that case latency stays null for the event.
+ */
+function parseLedgerClosedAt(raw: unknown): number | null {
+  if (typeof raw !== "string" || raw.length === 0) return null;
+  const ms = Date.parse(raw);
+  return Number.isNaN(ms) ? null : ms;
 }
 
 /**
@@ -203,6 +223,7 @@ export async function coldStartScan(): Promise<void> {
         topics: ev.topic,
         value: ev.value,
         txHash: ev.txHash ?? "",
+        ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
       });
     }
     lastLedgerSeen = res.latestLedger;
@@ -218,7 +239,9 @@ export async function coldStartScan(): Promise<void> {
   }
 
   // Process the whole accumulated batch with per-tx dedup, then seed.
-  const chronological = processRawEventBatch(rawBatch);
+  // Back-fill records carry null latency — the store only computes the
+  // avg-latency counter from live observations.
+  const chronological = processRawEventBatch(rawBatch).map((p) => p.event);
   networkState.seedWindow(chronological);
   // Recent ring buffer: keep newest at index 0.
   const newestFirst = [...chronological].reverse();
@@ -247,9 +270,10 @@ async function pollTick(): Promise<void> {
       topics: ev.topic,
       value: ev.value,
       txHash: ev.txHash ?? "",
+      ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
     }));
-    for (const mapped of processRawEventBatch(rawBatch)) {
-      publish(mapped);
+    for (const processed of processRawEventBatch(rawBatch)) {
+      publish(processed.event, processed.ledgerClosedAtMs);
     }
     lastLedgerSeen = Math.max(lastLedgerSeen, res.latestLedger);
   } catch (err) {

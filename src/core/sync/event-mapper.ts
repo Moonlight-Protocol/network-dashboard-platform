@@ -16,6 +16,12 @@ export type RawChainEvent = {
   value: xdr.ScVal;
   /** Soroban transaction hash — used to dedupe per-tx fee fan-out. */
   txHash: string;
+  /**
+   * Ledger close time in ms (when Soroban verified the transaction on-chain).
+   * Null when the watcher couldn't extract it (older SDK responses or
+   * cold-start back-fill). Drives the submitted→verified latency metric.
+   */
+  ledgerClosedAtMs: number | null;
 };
 
 const COUNCIL_TOPICS = new Set([
