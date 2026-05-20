@@ -4,10 +4,32 @@ import { STELLAR_RPC_URL } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
 import { networkEventBus } from "@/core/events/bus.ts";
 import { mapChainEvent, type RawChainEvent } from "./event-mapper.ts";
+import {
+  CONTRACT_INITIALIZED_TOPIC_PATTERN,
+  drainPendingAdoptions,
+  evaluateUnknownContract,
+  isContractInitListenerEnabled,
+} from "./contract-init-listener.ts";
 
 const POLL_INTERVAL_MS = 5_000;
 const LOOKBACK_LEDGERS_24H = 17_280; // ~5s ledgers × 24h
 const PAGE_LIMIT = 100;
+/**
+ * Soroban RPC caps `contractIds` per filter (5 in stellar-soroban-rpc as
+ * of writing). We split the watched-contracts set into chunks of this size
+ * and issue one getEvents call per chunk — both for the forward poll and
+ * the cold-start scan.
+ */
+const CONTRACT_IDS_PER_FILTER = 5;
+
+function chunkContractIds(ids: string[]): string[][] {
+  if (ids.length === 0) return [];
+  const out: string[][] = [];
+  for (let i = 0; i < ids.length; i += CONTRACT_IDS_PER_FILTER) {
+    out.push(ids.slice(i, i + CONTRACT_IDS_PER_FILTER));
+  }
+  return out;
+}
 
 /** RPC client — picked up from env via the lazy getter so tests can stub. */
 let rpcServer: Server | null = null;
@@ -168,79 +190,90 @@ export async function coldStartScan(): Promise<void> {
     contractCount: contractIds.length,
   });
 
-  let nextLedger = initialStart;
-  let page = 0;
   const rawBatch: RawChainEvent[] = [];
 
-  // Walk forward in ledger ranges. The Soroban RPC orders events by ledger
-  // ascending; when a page fills, the last event's `ledger + 1` is the
-  // next startLedger. Loop terminates when a page returns fewer events
-  // than the page limit (i.e., caught up to head).
-  while (true) {
-    let res;
-    try {
-      res = await server.getEvents({
-        startLedger: nextLedger,
-        filters: [{ type: "contract", contractIds }],
-        limit: PAGE_LIMIT,
-      });
-    } catch (err) {
-      // First-page out-of-range failure: retry once at the RPC's valid floor.
-      const floor = page === 0 ? parseValidRangeFloor(err) : null;
-      if (floor !== null && floor > nextLedger) {
-        LOG.warn("Cold-start scan startLedger below retention; retrying", {
-          requestedStartLedger: nextLedger,
-          retentionFloor: floor,
+  // Walk forward in ledger ranges for each contractIds chunk independently.
+  // Each chunk holds at most CONTRACT_IDS_PER_FILTER contracts; getEvents
+  // pages until a partial page indicates "caught up to head" for that
+  // chunk. The page cap (50) is per-chunk and only fires on pathological
+  // event volume.
+  let totalPages = 0;
+  for (const chunk of chunkContractIds(contractIds)) {
+    let nextLedger = initialStart;
+    let page = 0;
+    while (true) {
+      let res;
+      try {
+        res = await server.getEvents({
+          startLedger: nextLedger,
+          filters: [{ type: "contract", contractIds: chunk }],
+          limit: PAGE_LIMIT,
         });
-        nextLedger = floor;
-        try {
-          res = await server.getEvents({
-            startLedger: nextLedger,
-            filters: [{ type: "contract", contractIds }],
-            limit: PAGE_LIMIT,
+      } catch (err) {
+        // First-page out-of-range failure: retry once at the RPC's valid floor.
+        const floor = page === 0 ? parseValidRangeFloor(err) : null;
+        if (floor !== null && floor > nextLedger) {
+          LOG.warn("Cold-start scan startLedger below retention; retrying", {
+            requestedStartLedger: nextLedger,
+            retentionFloor: floor,
           });
-        } catch (err2) {
-          LOG.warn("Cold-start scan retry at retention floor failed", {
+          nextLedger = floor;
+          try {
+            res = await server.getEvents({
+              startLedger: nextLedger,
+              filters: [{ type: "contract", contractIds: chunk }],
+              limit: PAGE_LIMIT,
+            });
+          } catch (err2) {
+            LOG.warn("Cold-start scan retry at retention floor failed", {
+              startLedger: nextLedger,
+              error: describeErr(err2),
+            });
+            break;
+          }
+        } else {
+          LOG.warn("Cold-start scan page failed (stopping chunk)", {
+            page,
             startLedger: nextLedger,
-            error: describeErr(err2),
+            chunkSize: chunk.length,
+            error: describeErr(err),
           });
           break;
         }
-      } else {
-        LOG.warn("Cold-start scan page failed (stopping)", {
-          page,
-          startLedger: nextLedger,
-          error: describeErr(err),
+      }
+      page++;
+      totalPages++;
+      for (const ev of res.events) {
+        rawBatch.push({
+          contractId: ev.contractId?.toString() ?? "",
+          ledger: ev.ledger,
+          topics: ev.topic,
+          value: ev.value,
+          txHash: ev.txHash ?? "",
+          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
+        });
+      }
+      lastLedgerSeen = res.latestLedger;
+      if (res.events.length < PAGE_LIMIT) break;
+      const lastLedgerInPage = res.events[res.events.length - 1].ledger;
+      nextLedger = lastLedgerInPage + 1;
+      if (page >= 50) {
+        LOG.warn("Cold-start scan hit page cap (50) for chunk; stopping", {
+          eventsSoFar: rawBatch.length,
+          chunkSize: chunk.length,
         });
         break;
       }
     }
-    page++;
-    for (const ev of res.events) {
-      rawBatch.push({
-        contractId: ev.contractId?.toString() ?? "",
-        ledger: ev.ledger,
-        topics: ev.topic,
-        value: ev.value,
-        txHash: ev.txHash ?? "",
-        ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
-      });
-    }
-    lastLedgerSeen = res.latestLedger;
-    if (res.events.length < PAGE_LIMIT) break;
-    const lastLedgerInPage = res.events[res.events.length - 1].ledger;
-    nextLedger = lastLedgerInPage + 1;
-    if (page >= 50) {
-      LOG.warn("Cold-start scan hit page cap (50); stopping early", {
-        eventsSoFar: rawBatch.length,
-      });
-      break;
-    }
   }
+  const page = totalPages;
 
   // Process the whole accumulated batch with per-tx dedup, then seed.
   // Back-fill records carry null latency — the store only computes the
-  // avg-latency counter from live observations.
+  // avg-latency counter from live observations. Chunked scans return
+  // events grouped per chunk, so re-sort by ledger here to keep the
+  // ring-buffer chronological.
+  rawBatch.sort((a, b) => a.ledger - b.ledger);
   const chronological = processRawEventBatch(rawBatch).map((p) => p.event);
   networkState.seedWindow(chronological);
   // Recent ring buffer: keep newest at index 0.
@@ -256,31 +289,95 @@ export async function coldStartScan(): Promise<void> {
 async function pollTick(): Promise<void> {
   if (!running || lastLedgerSeen === null) return;
   const contractIds = watchedContractIds();
-  if (contractIds.length === 0) return;
-  try {
-    const server = getServer();
-    const res = await server.getEvents({
-      startLedger: lastLedgerSeen + 1,
-      filters: [{ type: "contract", contractIds }],
-      limit: PAGE_LIMIT,
-    });
-    const rawBatch: RawChainEvent[] = res.events.map((ev) => ({
-      contractId: ev.contractId?.toString() ?? "",
-      ledger: ev.ledger,
-      topics: ev.topic,
-      value: ev.value,
-      txHash: ev.txHash ?? "",
-      ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
-    }));
-    for (const processed of processRawEventBatch(rawBatch)) {
-      publish(processed.event, processed.ledgerClosedAtMs);
+
+  // Soroban's getEvents intersects multiple filter entries within a single
+  // call: combining `contractIds: [...]` with a separate topic-only filter
+  // restricts the response to the contractIds — the topic-only filter is
+  // effectively ignored. So we issue two independent calls per tick:
+  //   A) known contracts (the existing behaviour)
+  //   B) network-wide `contract_initialized` for new-council discovery
+  // and merge their result sets.
+  const server = getServer();
+  const startLedger = lastLedgerSeen + 1;
+  let nextLastLedger = lastLedgerSeen;
+  const rawBatch: RawChainEvent[] = [];
+  const unknownCandidates = new Set<string>();
+  const knownIds = new Set(contractIds);
+
+  // Soroban caps contractIds-per-filter at 5; once the network grows past
+  // that we have to split the known-contracts subscription into multiple
+  // getEvents calls. One call per chunk per tick.
+  for (const chunk of chunkContractIds(contractIds)) {
+    try {
+      const res = await server.getEvents({
+        startLedger,
+        filters: [{ type: "contract", contractIds: chunk }],
+        limit: PAGE_LIMIT,
+      });
+      nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
+      for (const ev of res.events) {
+        rawBatch.push({
+          contractId: ev.contractId?.toString() ?? "",
+          ledger: ev.ledger,
+          topics: ev.topic,
+          value: ev.value,
+          txHash: ev.txHash ?? "",
+          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
+        });
+      }
+    } catch (err) {
+      LOG.warn("Soroban poll (known contracts) failed", {
+        chunkSize: chunk.length,
+        error: describeErr(err),
+      });
     }
-    lastLedgerSeen = Math.max(lastLedgerSeen, res.latestLedger);
-  } catch (err) {
-    LOG.warn("Soroban poll failed", {
-      error: err instanceof Error ? err.message : String(err),
+  }
+
+  if (isContractInitListenerEnabled()) {
+    try {
+      const res = await server.getEvents({
+        startLedger,
+        filters: [{
+          type: "contract",
+          topics: [CONTRACT_INITIALIZED_TOPIC_PATTERN],
+        }],
+        limit: PAGE_LIMIT,
+      });
+      nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
+      for (const ev of res.events) {
+        const cid = ev.contractId?.toString() ?? "";
+        if (!cid) continue;
+        // Already-known contracts are handled by the contractIds-filter
+        // call above (which carries full event data); skip the duplicate.
+        if (knownIds.has(cid)) continue;
+        unknownCandidates.add(cid);
+      }
+    } catch (err) {
+      LOG.warn("Soroban poll (contract_initialized) failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  for (const processed of processRawEventBatch(rawBatch)) {
+    publish(processed.event, processed.ledgerClosedAtMs);
+  }
+  for (const cid of unknownCandidates) {
+    evaluateUnknownContract(cid).catch((err) => {
+      LOG.warn("evaluateUnknownContract failed", {
+        contractId: cid,
+        error: err instanceof Error ? err.message : String(err),
+      });
     });
   }
+  // Retry any matched-but-not-yet-registered contracts. No-op when nothing
+  // is pending, so this is cheap when council-platform is caught up.
+  drainPendingAdoptions().catch((err) => {
+    LOG.warn("drainPendingAdoptions failed", {
+      error: err instanceof Error ? err.message : String(err),
+    });
+  });
+  lastLedgerSeen = nextLastLedger;
 }
 
 function scheduleNext(): void {
