@@ -200,13 +200,20 @@ export class NetworkStateStore {
   }
 
   /**
-   * Replace the rolling window wholesale (used by the 24h cold-start scan).
-   * Each entry's amount + asset are extracted from its NetworkEvent payload.
-   * Latency is unknown for back-fill, so latencyMs is left null.
+   * Merge a back-fill batch into the rolling window (used by the 24h
+   * cold-start scan + hourly re-sync). Events whose id is already in the
+   * window are LEFT ALONE — that preserves live-captured `latencyMs`
+   * samples the forward poller recorded since the previous seed. Only
+   * truly new events from the back-fill (with null latency) get added.
+   *
+   * Without this merge, every topology refresh wiped the throughput +
+   * latency observations, leaving the snapshot's `latencyMs` at null
+   * even during active workloads.
    */
   seedWindow(events: NetworkEvent[]): void {
-    this.metrics = [];
+    const existing = new Set(this.metrics.map((m) => m.id));
     for (const e of events) {
+      if (existing.has(e.id)) continue;
       const ts = Date.parse(e.occurredAt);
       if (Number.isNaN(ts)) continue;
       const { assetContractId, amountStroops } = readPayload(e);

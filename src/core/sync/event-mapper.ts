@@ -8,6 +8,12 @@ import type { NetworkEvent, NetworkEventKind } from "@/core/events/types.ts";
  * decoded XDR ScVals so mappers can inspect kind-specific structure.
  */
 export type RawChainEvent = {
+  /**
+   * Soroban's own event id (e.g. "0000000123-0000000001"). Stable across
+   * live-poll vs cold-start observations of the same on-chain event, so
+   * downstream dedup actually works.
+   */
+  id: string;
   contractId: string;
   ledger: number;
   /** Topics as raw ScVals (preserve XDR fidelity for value decoding). */
@@ -193,7 +199,10 @@ function makeEvent(
   payload: Record<string, unknown>,
 ): NetworkEvent {
   return {
-    id: crypto.randomUUID(),
+    // Reuse Soroban's stable event id so the same on-chain event lands
+    // on the same NetworkEvent id whether observed live or via the
+    // cold-start scan — the store's dedup-by-id relies on this.
+    id: raw.id,
     kind,
     councilId,
     councilName,

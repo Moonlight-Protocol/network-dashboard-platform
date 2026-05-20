@@ -245,6 +245,7 @@ export async function coldStartScan(): Promise<void> {
       totalPages++;
       for (const ev of res.events) {
         rawBatch.push({
+          id: ev.id,
           contractId: ev.contractId?.toString() ?? "",
           ledger: ev.ledger,
           topics: ev.topic,
@@ -317,6 +318,7 @@ async function pollTick(): Promise<void> {
       nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
       for (const ev of res.events) {
         rawBatch.push({
+          id: ev.id,
           contractId: ev.contractId?.toString() ?? "",
           ledger: ev.ledger,
           topics: ev.topic,
