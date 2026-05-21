@@ -111,6 +111,13 @@ export type SnapshotFrame = {
 export type LiveFrame = {
   type: "event";
   event: NetworkEvent;
+  /**
+   * Current counter values at the moment of broadcast. Lets the SPA
+   * refresh the counter strip on every event instead of only at snapshot
+   * time — adding 1 small object per event is cheaper than periodic
+   * snapshot pushes.
+   */
+  counters: Counters;
 };
 
 export type ServerFrame = SnapshotFrame | LiveFrame;
