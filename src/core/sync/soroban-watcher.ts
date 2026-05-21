@@ -164,11 +164,44 @@ function parseValidRangeFloor(err: unknown): number | null {
 export async function coldStartScan(): Promise<void> {
   const server = getServer();
   const latest = await server.getLatestLedger();
-  const lookback = Math.min(
-    LOOKBACK_LEDGERS_24H,
-    Math.max(1, latest.sequence - 1),
+  // Soroban's *event* retention is much shorter than its ledger retention
+  // (getHealth.oldestLedger). Querying below the events floor returns
+  // 0 events without erroring, so probe with progressively smaller
+  // lookbacks until events appear. Long-retention providers (testnet /
+  // mainnet) typically return events on the first try; the quickstart
+  // container needs a closer startLedger.
+  const desiredStart = Math.max(
+    1,
+    latest.sequence - LOOKBACK_LEDGERS_24H,
   );
-  const initialStart = Math.max(1, latest.sequence - lookback);
+  let initialStart = desiredStart;
+  const probeLookbacks = [LOOKBACK_LEDGERS_24H, 10000, 5000, 2000, 500, 100];
+  for (const back of probeLookbacks) {
+    const tryStart = Math.max(1, latest.sequence - back);
+    try {
+      const probe = await server.getEvents({
+        startLedger: tryStart,
+        filters: [{ type: "contract" }],
+        limit: 1,
+      });
+      if (probe.events.length > 0) {
+        initialStart = tryStart;
+        if (back !== LOOKBACK_LEDGERS_24H) {
+          LOG.info("Cold-start scan clamped to events retention floor", {
+            desiredStart,
+            workingStart: tryStart,
+            lookbackLedgers: back,
+          });
+        }
+        break;
+      }
+    } catch (err) {
+      LOG.debug("Cold-start probe failed at lookback", {
+        back,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
   const contractIds = watchedContractIds();
 
   if (contractIds.length === 0) {
