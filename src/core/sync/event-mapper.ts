@@ -198,6 +198,13 @@ function makeEvent(
   now: Date,
   payload: Record<string, unknown>,
 ): NetworkEvent {
+  // Prefer the ledger close time over wall-clock so back-filled events
+  // distribute over the real chain timeline (throughput, sparklines,
+  // rolling windows are all bucketed by this). Fallback to `now` is only
+  // for the rare case the watcher couldn't extract `ledgerClosedAt`.
+  const occurredAt = raw.ledgerClosedAtMs !== null
+    ? new Date(raw.ledgerClosedAtMs).toISOString()
+    : now.toISOString();
   return {
     // Reuse Soroban's stable event id so the same on-chain event lands
     // on the same NetworkEvent id whether observed live or via the
@@ -207,7 +214,7 @@ function makeEvent(
     councilId,
     councilName,
     ledger: raw.ledger,
-    occurredAt: now.toISOString(),
+    occurredAt,
     payload,
   };
 }
