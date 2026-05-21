@@ -8,6 +8,12 @@ import type { NetworkEvent, NetworkEventKind } from "@/core/events/types.ts";
  * decoded XDR ScVals so mappers can inspect kind-specific structure.
  */
 export type RawChainEvent = {
+  /**
+   * Soroban's own event id (e.g. "0000000123-0000000001"). Stable across
+   * live-poll vs cold-start observations of the same on-chain event, so
+   * downstream dedup actually works.
+   */
+  id: string;
   contractId: string;
   ledger: number;
   /** Topics as raw ScVals (preserve XDR fidelity for value decoding). */
@@ -16,6 +22,12 @@ export type RawChainEvent = {
   value: xdr.ScVal;
   /** Soroban transaction hash — used to dedupe per-tx fee fan-out. */
   txHash: string;
+  /**
+   * Ledger close time in ms (when Soroban verified the transaction on-chain).
+   * Null when the watcher couldn't extract it (older SDK responses or
+   * cold-start back-fill). Drives the submitted→verified latency metric.
+   */
+  ledgerClosedAtMs: number | null;
 };
 
 const COUNCIL_TOPICS = new Set([
@@ -186,13 +198,23 @@ function makeEvent(
   now: Date,
   payload: Record<string, unknown>,
 ): NetworkEvent {
+  // Prefer the ledger close time over wall-clock so back-filled events
+  // distribute over the real chain timeline (throughput, sparklines,
+  // rolling windows are all bucketed by this). Fallback to `now` is only
+  // for the rare case the watcher couldn't extract `ledgerClosedAt`.
+  const occurredAt = raw.ledgerClosedAtMs !== null
+    ? new Date(raw.ledgerClosedAtMs).toISOString()
+    : now.toISOString();
   return {
-    id: crypto.randomUUID(),
+    // Reuse Soroban's stable event id so the same on-chain event lands
+    // on the same NetworkEvent id whether observed live or via the
+    // cold-start scan — the store's dedup-by-id relies on this.
+    id: raw.id,
     kind,
     councilId,
     councilName,
     ledger: raw.ledger,
-    occurredAt: now.toISOString(),
+    occurredAt,
     payload,
   };
 }

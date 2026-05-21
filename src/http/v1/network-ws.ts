@@ -64,7 +64,11 @@ export function networkWsHandler(ctx: Context): void {
   socket.onopen = () => {
     sendFrame(buildSnapshotFrame());
     unsubscribe = networkEventBus.subscribe((event) => {
-      sendFrame({ type: "event", event });
+      sendFrame({
+        type: "event",
+        event,
+        counters: buildSnapshotFrame().counters,
+      });
     });
     LOG.info("Network WS opened", {
       subscribers: networkEventBus.listenerCount(),

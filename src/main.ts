@@ -12,23 +12,37 @@ import {
   stopSorobanWatcher,
 } from "@/core/sync/soroban-watcher.ts";
 import { startScheduler, stopScheduler } from "@/core/sync/scheduler.ts";
+import { refreshWasmRegistry } from "@/core/sync/wasm-registry.ts";
 
 /**
  * Bootstrap order:
- *   1. Fetch council-platform topology → populate linkage maps so the
+ *   1. Fetch the Channel Auth WASM hash registry from soroban-core's
+ *      GitHub releases. The new-council listener short-circuits to a
+ *      no-op until this returns a non-empty set, so we do it before the
+ *      Soroban watcher starts.
+ *   2. Fetch council-platform topology → populate linkage maps so the
  *      Soroban watcher knows which contractIds to subscribe to.
- *   2. Cold-start scan: walk trailing 24h on those contracts to seed the
+ *   3. Cold-start scan: walk trailing 24h on those contracts to seed the
  *      rolling counter window + activity-feed ring buffer.
- *   3. Start the forward poller (Soroban watcher).
- *   4. Start the scheduler (hourly re-sync + minute window sweep).
- *   5. Start the HTTP server.
+ *   4. Start the forward poller (Soroban watcher).
+ *   5. Start the scheduler (hourly re-sync + minute window sweep).
+ *   6. Start the HTTP server.
  *
- * Steps 1–2 are best-effort: a failure logs + continues so the service
+ * Steps 1–3 are best-effort: a failure logs + continues so the service
  * still serves a (degraded) snapshot rather than refusing to boot. The
- * hourly re-sync will retry.
+ * hourly re-sync re-fetches both the WASM registry and the topology so
+ * a boot-time outage self-heals.
  */
 async function bootstrap() {
   try {
+    try {
+      await refreshWasmRegistry();
+    } catch (err) {
+      LOG.error("Initial WASM registry fetch failed (continuing degraded)", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+
     try {
       const topology = await fetchCouncilTopology();
       networkState.replaceTopology(topology);
