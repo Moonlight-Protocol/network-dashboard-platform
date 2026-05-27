@@ -1,9 +1,10 @@
 import { Application } from "@oak/oak";
 
-import apiV1 from "@/http/v1/v1.routes.ts";
+import { buildApiRouter } from "@/http/v1/v1.routes.ts";
 import { corsMiddleware } from "@/http/middleware/cors.ts";
 import { PORT } from "@/config/env.ts";
-import { LOG } from "@/config/logger.ts";
+import { createLogger } from "@/config/logger.ts";
+import { NetworkEventBus } from "@/core/events/bus.ts";
 import { networkState } from "@/core/state/store.ts";
 import { fetchCouncilTopology } from "@/core/sync/council-fetch.ts";
 import {
@@ -34,46 +35,55 @@ import { refreshWasmRegistry } from "@/core/sync/wasm-registry.ts";
  * a boot-time outage self-heals.
  */
 async function bootstrap() {
+  const rootLog = createLogger();
+  const log = rootLog.scope("bootstrap");
+  log.info("bootstrap");
+
+  const bus = new NetworkEventBus({ log: rootLog });
+  const deps = { log: rootLog, bus };
+
   try {
     try {
-      await refreshWasmRegistry();
+      await refreshWasmRegistry({ log: rootLog });
     } catch (err) {
-      LOG.error("Initial WASM registry fetch failed (continuing degraded)", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.error(
+        err,
+        "initial WASM registry fetch failed (continuing degraded)",
+      );
     }
 
     try {
-      const topology = await fetchCouncilTopology();
+      const topology = await fetchCouncilTopology({ log: rootLog });
       networkState.replaceTopology(topology);
     } catch (err) {
-      LOG.error("Initial council-platform fetch failed (continuing degraded)", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.error(
+        err,
+        "initial council-platform fetch failed (continuing degraded)",
+      );
     }
 
     try {
-      await coldStartScan();
+      await coldStartScan(deps);
     } catch (err) {
-      LOG.error("Cold-start scan failed (continuing degraded)", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.error(err, "cold-start scan failed (continuing degraded)");
     }
 
-    startSorobanWatcher();
-    startScheduler();
+    startSorobanWatcher(deps);
+    startScheduler(deps);
 
     const app = new Application();
     app.use(corsMiddleware);
+    const apiV1 = buildApiRouter(deps);
     app.use(apiV1.routes());
     app.use(apiV1.allowedMethods());
 
-    LOG.info(`network-dashboard-platform running on http://localhost:${PORT}`);
+    log.debug("port", PORT);
+    log.event(`network-dashboard-platform running on http://localhost:${PORT}`);
 
     const shutdown = () => {
-      LOG.info("Shutting down...");
-      stopSorobanWatcher();
-      stopScheduler();
+      log.event("shutting down");
+      stopSorobanWatcher({ log: rootLog });
+      stopScheduler({ log: rootLog });
       Deno.exit(0);
     };
     Deno.addSignalListener("SIGINT", shutdown);
@@ -81,11 +91,9 @@ async function bootstrap() {
 
     await app.listen({ port: PORT });
   } catch (err) {
-    LOG.fatal("Failed to start", {
-      error: err instanceof Error ? err.message : String(err),
-    });
-    stopSorobanWatcher();
-    stopScheduler();
+    log.error(err, "failed to start");
+    stopSorobanWatcher({ log: rootLog });
+    stopScheduler({ log: rootLog });
     Deno.exit(1);
   }
 }

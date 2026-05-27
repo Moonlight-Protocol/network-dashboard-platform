@@ -1,7 +1,7 @@
 import type { Context } from "@oak/oak";
 import { Router } from "@oak/oak";
-import { LOG } from "@/config/logger.ts";
-import { networkEventBus } from "@/core/events/bus.ts";
+import type { Logger } from "@/utils/logger/index.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { buildSnapshotFrame } from "@/core/state/snapshot.ts";
 import {
   NETWORK_WS_SUBPROTOCOL,
@@ -25,68 +25,80 @@ const IDLE_TIMEOUT_SECONDS = 30;
  *
  * No client → server frames. Clients reconnect rather than keep-alive.
  */
-export function networkWsHandler(ctx: Context): void {
-  if (!ctx.isUpgradable) {
-    ctx.response.status = 426;
-    ctx.response.body = { error: "WebSocket upgrade required" };
-    return;
-  }
+export function handleNetworkWs(
+  deps: { log: Logger; bus: NetworkEventBus },
+): (ctx: Context) => void {
+  const log = deps.log.scope("networkWs");
 
-  const socket = ctx.upgrade({
-    protocol: NETWORK_WS_SUBPROTOCOL,
-    idleTimeout: IDLE_TIMEOUT_SECONDS,
-  });
+  return (ctx: Context) => {
+    log.info("handleNetworkWs");
 
-  let unsubscribe: (() => void) | null = null;
-  let closed = false;
-
-  const cleanup = () => {
-    if (closed) return;
-    closed = true;
-    if (unsubscribe) {
-      unsubscribe();
-      unsubscribe = null;
+    if (!ctx.isUpgradable) {
+      ctx.response.status = 426;
+      ctx.response.body = { error: "WebSocket upgrade required" };
+      return;
     }
-  };
 
-  const sendFrame = (frame: ServerFrame): void => {
-    if (socket.readyState !== WebSocket.OPEN) return;
-    try {
-      socket.send(JSON.stringify(frame));
-    } catch (err) {
-      LOG.warn("Failed to send network WS frame", {
-        type: frame.type,
-        error: err instanceof Error ? err.message : String(err),
+    const socket = ctx.upgrade({
+      protocol: NETWORK_WS_SUBPROTOCOL,
+      idleTimeout: IDLE_TIMEOUT_SECONDS,
+    });
+
+    let unsubscribe: (() => void) | null = null;
+    let closed = false;
+
+    const cleanup = () => {
+      if (closed) return;
+      closed = true;
+      if (unsubscribe) {
+        unsubscribe();
+        unsubscribe = null;
+      }
+    };
+
+    const sendFrame = (frame: ServerFrame): void => {
+      if (socket.readyState !== WebSocket.OPEN) return;
+      try {
+        socket.send(JSON.stringify(frame));
+      } catch (err) {
+        log.debug("type", frame.type);
+        log.error(err, "failed to send network WS frame");
+      }
+    };
+
+    socket.onopen = () => {
+      sendFrame(buildSnapshotFrame());
+      unsubscribe = deps.bus.subscribe((event) => {
+        sendFrame({
+          type: "event",
+          event,
+          counters: buildSnapshotFrame().counters,
+        });
       });
-    }
-  };
+      log.debug("subscribers", deps.bus.listenerCount());
+      log.event("network WS opened");
+    };
 
-  socket.onopen = () => {
-    sendFrame(buildSnapshotFrame());
-    unsubscribe = networkEventBus.subscribe((event) => {
-      sendFrame({
-        type: "event",
-        event,
-        counters: buildSnapshotFrame().counters,
-      });
-    });
-    LOG.info("Network WS opened", {
-      subscribers: networkEventBus.listenerCount(),
-    });
-  };
+    socket.onclose = () => {
+      cleanup();
+      log.event("network WS closed");
+    };
 
-  socket.onclose = () => {
-    cleanup();
-    LOG.info("Network WS closed");
-  };
-
-  socket.onerror = (event) => {
-    LOG.warn("Network WS error", {
-      message: event instanceof ErrorEvent ? event.message : "unknown",
-    });
-    cleanup();
+    socket.onerror = (event) => {
+      log.debug(
+        "message",
+        event instanceof ErrorEvent ? event.message : "unknown",
+      );
+      log.error(event, "network WS error");
+      cleanup();
+    };
   };
 }
 
-export const networkWsRouter = new Router();
-networkWsRouter.get("/network/ws", networkWsHandler);
+export function buildNetworkWsRouter(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Router {
+  const router = new Router();
+  router.get("/network/ws", handleNetworkWs(deps));
+  return router;
+}

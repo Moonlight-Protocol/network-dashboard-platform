@@ -1,4 +1,4 @@
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
 import { COUNCIL_PLATFORM_URL } from "@/config/env.ts";
 import type { CouncilTopologyEntry } from "@/core/events/types.ts";
 
@@ -20,17 +20,25 @@ type PublicCouncil = {
 
 type PublicCouncilsResponse = { data?: PublicCouncil[] };
 
-export async function fetchCouncilTopology(): Promise<CouncilTopologyEntry[]> {
+export async function fetchCouncilTopology(
+  deps: { log: Logger },
+): Promise<CouncilTopologyEntry[]> {
+  const log = deps.log.scope("fetchCouncilTopology");
+  log.info("fetchCouncilTopology");
+
   const base = COUNCIL_PLATFORM_URL.replace(/\/+$/, "");
   const url = `${base}/api/v1/public/councils`;
+  log.debug("url", url);
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 15_000);
 
   try {
+    log.event("requesting council list");
     const res = await fetch(url, { signal: controller.signal });
     if (!res.ok) {
       throw new Error(`council-platform returned HTTP ${res.status}`);
     }
+    log.event("council list received");
     const body = (await res.json()) as PublicCouncilsResponse;
     const entries: CouncilTopologyEntry[] = [];
     for (const c of body.data ?? []) {
@@ -60,7 +68,8 @@ export async function fetchCouncilTopology(): Promise<CouncilTopologyEntry[]> {
           .filter((code): code is string => !!code),
       });
     }
-    LOG.info("Fetched council-platform topology", { count: entries.length });
+    log.debug("count", entries.length);
+    log.event("council-platform topology built");
     return entries;
   } finally {
     clearTimeout(timer);

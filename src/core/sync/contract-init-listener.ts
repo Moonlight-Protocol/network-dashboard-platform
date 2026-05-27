@@ -1,9 +1,10 @@
 import { Address, xdr } from "stellar-sdk";
 import { Server } from "stellar-sdk/rpc";
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
 import { STELLAR_RPC_URL } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
 import { refreshTopology } from "./topology-refresh.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import {
   isKnownChannelAuthHash,
   isReady as isWasmRegistryReady,
@@ -74,29 +75,30 @@ export function isContractInitListenerEnabled(): boolean {
  */
 export async function evaluateUnknownContract(
   contractId: string,
+  deps: { log: Logger; bus: NetworkEventBus },
 ): Promise<void> {
+  const log = deps.log.scope("evaluateUnknownContract");
+  log.info("evaluateUnknownContract");
+  log.debug("contractId", contractId);
+
   if (!isContractInitListenerEnabled()) return;
   if (!contractId) return;
   if (pendingAdoption.has(contractId)) return;
   if (notMoonlight.has(contractId)) return;
   if (networkState.hasCouncil(contractId)) return;
 
-  const wasmHash = await fetchWasmHash(contractId);
+  const wasmHash = await fetchWasmHash(contractId, { log });
   if (wasmHash === null) return;
   if (!isKnownChannelAuthHash(wasmHash)) {
     notMoonlight.add(contractId);
-    LOG.debug("Ignored contract_initialized from non-Moonlight contract", {
-      contractId,
-      wasmHash,
-    });
+    log.debug("wasmHash", wasmHash);
+    log.event("ignored contract_initialized from non-Moonlight contract");
     return;
   }
   pendingAdoption.add(contractId);
-  LOG.info("Detected new Channel Auth deploy via contract_initialized", {
-    contractId,
-    wasmHash,
-  });
-  await drainPendingAdoptions();
+  log.debug("wasmHash", wasmHash);
+  log.event("detected new Channel Auth deploy via contract_initialized");
+  await drainPendingAdoptions(deps);
 }
 
 /**
@@ -104,15 +106,20 @@ export async function evaluateUnknownContract(
  * WASM hash matched but which council-platform hasn't yet registered.
  * Called once per pollTick — no-op when nothing is pending.
  */
-export async function drainPendingAdoptions(): Promise<void> {
+export async function drainPendingAdoptions(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
   if (pendingAdoption.size === 0) return;
-  await refreshTopology(`pending=${pendingAdoption.size}`);
+  const log = deps.log.scope("drainPendingAdoptions");
+  log.info("drainPendingAdoptions");
+  log.debug("pendingCount", pendingAdoption.size);
+
+  await refreshTopology(`pending=${pendingAdoption.size}`, deps);
   for (const cid of [...pendingAdoption]) {
     if (networkState.hasCouncil(cid)) {
       pendingAdoption.delete(cid);
-      LOG.info("Pending Channel Auth contract adopted into topology", {
-        contractId: cid,
-      });
+      log.debug("contractId", cid);
+      log.event("pending Channel Auth contract adopted into topology");
     }
   }
 }
@@ -123,7 +130,11 @@ export function __resetForTests(): void {
   pendingAdoption.clear();
 }
 
-async function fetchWasmHash(contractId: string): Promise<string | null> {
+async function fetchWasmHash(
+  contractId: string,
+  deps: { log: Logger },
+): Promise<string | null> {
+  const log = deps.log.scope("fetchWasmHash");
   try {
     const server = getServer();
     const key = xdr.LedgerKey.contractData(
@@ -144,10 +155,8 @@ async function fetchWasmHash(contractId: string): Promise<string | null> {
       .map((b) => b.toString(16).padStart(2, "0"))
       .join("");
   } catch (err) {
-    LOG.debug("fetchWasmHash failed", {
-      contractId,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    log.debug("contractId", contractId);
+    log.error(err, "fetchWasmHash failed");
     return null;
   }
 }

@@ -1,14 +1,25 @@
 import { Router } from "@oak/oak";
+import type { Logger } from "@/utils/logger/index.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { healthRouter } from "./health.ts";
-import { networkWsRouter } from "./network-ws.ts";
+import { buildNetworkWsRouter } from "./network-ws.ts";
 
-const apiRouter = new Router();
+export function buildApiRouter(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Router {
+  const apiRouter = new Router();
+  const networkWsRouter = buildNetworkWsRouter(deps);
 
-apiRouter.use("/api/v1", healthRouter.routes(), healthRouter.allowedMethods());
-apiRouter.use(
-  "/api/v1",
-  networkWsRouter.routes(),
-  networkWsRouter.allowedMethods(),
-);
+  apiRouter.use(
+    "/api/v1",
+    healthRouter.routes(),
+    healthRouter.allowedMethods(),
+  );
+  apiRouter.use(
+    "/api/v1",
+    networkWsRouter.routes(),
+    networkWsRouter.allowedMethods(),
+  );
 
-export default apiRouter;
+  return apiRouter;
+}

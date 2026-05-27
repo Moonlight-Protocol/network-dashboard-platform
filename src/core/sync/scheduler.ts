@@ -1,4 +1,5 @@
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { networkState } from "@/core/state/store.ts";
 import { refreshTopology } from "./topology-refresh.ts";
 
@@ -9,38 +10,37 @@ let hourlyTimer: number | null = null;
 let minuteTimer: number | null = null;
 let running = false;
 
-function hourlyResync(): Promise<void> {
-  return refreshTopology("hourly resync");
-}
-
-function minuteSweep(): void {
-  const purged = networkState.sweepWindow();
-  if (purged > 0) {
-    LOG.debug("Minute sweep dropped stale window entries", { purged });
-  }
-}
-
-export function startScheduler(): void {
+export function startScheduler(
+  deps: { log: Logger; bus: NetworkEventBus },
+): void {
   if (running) return;
   running = true;
+  const log = deps.log.scope("scheduler");
+
+  function minuteSweep(): void {
+    const purged = networkState.sweepWindow();
+    if (purged > 0) {
+      log.debug("purged", purged);
+      log.event("minute sweep dropped stale window entries");
+    }
+  }
+
   hourlyTimer = setInterval(
     () => {
-      hourlyResync().catch((err) => {
-        LOG.error("Hourly re-sync threw", {
-          error: err instanceof Error ? err.message : String(err),
-        });
+      refreshTopology("hourly resync", deps).catch((err) => {
+        log.error(err, "hourly re-sync threw");
       });
     },
     HOURLY_RESYNC_MS,
   ) as unknown as number;
   minuteTimer = setInterval(minuteSweep, MINUTE_SWEEP_MS) as unknown as number;
-  LOG.info("Scheduler started", {
-    hourlyResyncMs: HOURLY_RESYNC_MS,
-    minuteSweepMs: MINUTE_SWEEP_MS,
-  });
+
+  log.debug("hourlyResyncMs", HOURLY_RESYNC_MS);
+  log.debug("minuteSweepMs", MINUTE_SWEEP_MS);
+  log.event("scheduler started");
 }
 
-export function stopScheduler(): void {
+export function stopScheduler(deps?: { log: Logger }): void {
   running = false;
   if (hourlyTimer !== null) {
     clearInterval(hourlyTimer);
@@ -50,5 +50,5 @@ export function stopScheduler(): void {
     clearInterval(minuteTimer);
     minuteTimer = null;
   }
-  LOG.info("Scheduler stopped");
+  deps?.log.scope("scheduler").event("scheduler stopped");
 }

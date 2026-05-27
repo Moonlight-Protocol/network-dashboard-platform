@@ -1,4 +1,4 @@
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
 
 /**
  * Registry of accepted Channel Auth WASM hashes.
@@ -57,7 +57,13 @@ export function __resetForTests(): void {
  * refreshes are kept so deploys against older council versions remain
  * recognised even if GitHub temporarily omits an old release.
  */
-export async function refreshWasmRegistry(): Promise<void> {
+export async function refreshWasmRegistry(
+  deps: { log: Logger },
+): Promise<void> {
+  const log = deps.log.scope("refreshWasmRegistry");
+  log.info("refreshWasmRegistry");
+  log.debug("repo", RELEASES_REPO);
+
   let releases: Array<
     {
       tag_name: string;
@@ -65,22 +71,23 @@ export async function refreshWasmRegistry(): Promise<void> {
     }
   >;
   try {
+    log.event("fetching release list");
     const res = await fetch(RELEASES_URL, {
       headers: { "Accept": "application/vnd.github+json" },
     });
     if (!res.ok) {
-      LOG.warn("Channel Auth WASM registry fetch failed", {
-        repo: RELEASES_REPO,
-        status: res.status,
-      });
+      log.debug("status", res.status);
+      log.error(
+        new Error(`HTTP ${res.status}`),
+        "Channel Auth WASM registry fetch failed",
+      );
       return;
     }
     releases = await res.json();
+    log.event("release list fetched");
+    log.debug("releaseCount", releases.length);
   } catch (err) {
-    LOG.warn("Channel Auth WASM registry fetch threw", {
-      repo: RELEASES_REPO,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    log.error(err, "Channel Auth WASM registry fetch threw");
     return;
   }
 
@@ -91,37 +98,34 @@ export async function refreshWasmRegistry(): Promise<void> {
     try {
       const dl = await fetch(asset.browser_download_url);
       if (!dl.ok) {
-        LOG.warn("Channel Auth WASM download failed", {
-          tag: r.tag_name,
-          status: dl.status,
-        });
+        log.debug("tag", r.tag_name);
+        log.debug("status", dl.status);
+        log.error(
+          new Error(`HTTP ${dl.status}`),
+          "Channel Auth WASM download failed",
+        );
         continue;
       }
       const buf = await dl.arrayBuffer();
       const hash = await sha256Hex(buf);
       if (!validHashes.has(hash)) {
         validHashes.add(hash);
-        LOG.info("Channel Auth WASM registered", {
-          tag: r.tag_name,
-          wasmHash: hash,
-          bytes: buf.byteLength,
-        });
+        log.debug("tag", r.tag_name);
+        log.debug("wasmHash", hash);
+        log.debug("bytes", buf.byteLength);
+        log.event("Channel Auth WASM registered");
       }
     } catch (err) {
-      LOG.warn("Channel Auth WASM probe threw", {
-        tag: r.tag_name,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.debug("tag", r.tag_name);
+      log.error(err, "Channel Auth WASM probe threw");
     }
   }
 
   lastRefreshOk = validHashes.size > 0;
-  LOG.info("Channel Auth WASM registry refreshed", {
-    repo: RELEASES_REPO,
-    totalReleases: releases.length,
-    knownHashes: validHashes.size,
-    addedSinceLast: validHashes.size - beforeCount,
-  });
+  log.debug("totalReleases", releases.length);
+  log.debug("knownHashes", validHashes.size);
+  log.debug("addedSinceLast", validHashes.size - beforeCount);
+  log.event("Channel Auth WASM registry refreshed");
 }
 
 async function sha256Hex(buf: ArrayBuffer): Promise<string> {

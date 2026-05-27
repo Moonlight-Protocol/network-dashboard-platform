@@ -1,3 +1,4 @@
+import type { Logger } from "@/utils/logger/index.ts";
 import type { NetworkEvent } from "./types.ts";
 
 type Listener = (event: NetworkEvent) => void;
@@ -11,10 +12,15 @@ type Listener = (event: NetworkEvent) => void;
  * replaced.
  *
  * A misbehaving listener must never break the publish loop — every
- * delivery is wrapped in a try/catch.
+ * delivery is wrapped in a try/catch and reported via the injected logger.
  */
-class NetworkEventBus {
+export class NetworkEventBus {
   private listeners = new Set<Listener>();
+  private log: Logger;
+
+  constructor(deps: { log: Logger }) {
+    this.log = deps.log.scope("NetworkEventBus");
+  }
 
   subscribe(listener: Listener): () => void {
     this.listeners.add(listener);
@@ -28,7 +34,7 @@ class NetworkEventBus {
       try {
         listener(event);
       } catch (err) {
-        console.warn("[network-event-bus] listener threw:", err);
+        this.log.error(err, "listener threw during publish");
       }
     }
   }
@@ -37,5 +43,3 @@ class NetworkEventBus {
     return this.listeners.size;
   }
 }
-
-export const networkEventBus = new NetworkEventBus();
