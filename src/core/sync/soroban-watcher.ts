@@ -420,13 +420,13 @@ export function startSorobanWatcher(
   scheduleNext(deps);
 }
 
-export function stopSorobanWatcher(deps?: { log: Logger }): void {
+export function stopSorobanWatcher(deps: { log: Logger }): void {
   running = false;
   if (pollTimer !== null) {
     clearTimeout(pollTimer);
     pollTimer = null;
   }
-  deps?.log.scope("sorobanWatcher").event("soroban watcher stopped");
+  deps.log.scope("sorobanWatcher").event("soroban watcher stopped");
 }
 
 /** Re-anchor the rolling 24h counter window after the hourly re-sync. */

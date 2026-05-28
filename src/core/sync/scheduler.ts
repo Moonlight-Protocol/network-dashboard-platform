@@ -40,7 +40,7 @@ export function startScheduler(
   log.event("scheduler started");
 }
 
-export function stopScheduler(deps?: { log: Logger }): void {
+export function stopScheduler(deps: { log: Logger }): void {
   running = false;
   if (hourlyTimer !== null) {
     clearInterval(hourlyTimer);
@@ -50,5 +50,5 @@ export function stopScheduler(deps?: { log: Logger }): void {
     clearInterval(minuteTimer);
     minuteTimer = null;
   }
-  deps?.log.scope("scheduler").event("scheduler stopped");
+  deps.log.scope("scheduler").event("scheduler stopped");
 }
