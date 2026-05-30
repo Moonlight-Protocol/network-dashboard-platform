@@ -23,13 +23,19 @@ export class NetworkEventBus {
   }
 
   subscribe(listener: Listener): () => void {
+    this.log.info("subscribe");
     this.listeners.add(listener);
+    this.log.debug("listenerCount", this.listeners.size);
     return () => {
+      this.log.info("unsubscribe");
       this.listeners.delete(listener);
     };
   }
 
   publish(event: NetworkEvent): void {
+    this.log.info("publish");
+    this.log.debug("eventKind", event.kind);
+    this.log.debug("listenerCount", this.listeners.size);
     for (const listener of this.listeners) {
       try {
         listener(event);

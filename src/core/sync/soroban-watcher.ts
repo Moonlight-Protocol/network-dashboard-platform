@@ -63,13 +63,20 @@ function publishMappedEvent(
   event: ReturnType<typeof mapChainEvent>,
   ledgerClosedAtMs: number | null,
   bus: NetworkEventBus,
+  log: Logger,
 ): void {
+  log.info("publishMappedEvent");
   if (!event) return;
+  log.debug("kind", event.kind);
   const latencyMs = ledgerClosedAtMs === null
     ? null
     : Math.max(0, Date.now() - ledgerClosedAtMs);
   const wasNew = networkState.recordEvent(event, latencyMs);
-  if (!wasNew) return;
+  if (!wasNew) {
+    log.event("event already seen, skipping publish");
+    return;
+  }
+  log.event("publishing event to bus");
   bus.publish(event);
 }
 
@@ -89,7 +96,12 @@ type ProcessedEvent = {
   ledgerClosedAtMs: number | null;
 };
 
-function processRawEventBatch(raws: RawChainEvent[]): ProcessedEvent[] {
+function processRawEventBatch(
+  raws: RawChainEvent[],
+  log: Logger,
+): ProcessedEvent[] {
+  log.info("processRawEventBatch");
+  log.debug("rawCount", raws.length);
   const byTx = new Map<string, ProcessedEvent[]>();
   const txOrder: string[] = [];
   for (const raw of raws) {
@@ -297,7 +309,7 @@ export async function coldStartScan(
   // events grouped per chunk, so re-sort by ledger here to keep the
   // ring-buffer chronological.
   rawBatch.sort((a, b) => a.ledger - b.ledger);
-  const chronological = processRawEventBatch(rawBatch).map((p) => p.event);
+  const chronological = processRawEventBatch(rawBatch, log).map((p) => p.event);
   networkState.seedWindow(chronological);
   // Recent ring buffer: keep newest at index 0.
   const newestFirst = [...chronological].reverse();
@@ -383,8 +395,13 @@ async function pollTick(
     }
   }
 
-  for (const processed of processRawEventBatch(rawBatch)) {
-    publishMappedEvent(processed.event, processed.ledgerClosedAtMs, deps.bus);
+  for (const processed of processRawEventBatch(rawBatch, log)) {
+    publishMappedEvent(
+      processed.event,
+      processed.ledgerClosedAtMs,
+      deps.bus,
+      log,
+    );
   }
   for (const cid of unknownCandidates) {
     evaluateUnknownContract(cid, deps).catch((err) => {
