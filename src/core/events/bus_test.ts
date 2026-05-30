@@ -1,5 +1,6 @@
 import { assertEquals } from "@std/assert";
-import { networkEventBus } from "./bus.ts";
+import { NetworkEventBus } from "./bus.ts";
+import { newNoop } from "@/utils/logger/index.ts";
 import type { NetworkEvent } from "./types.ts";
 
 function ev(id: string): NetworkEvent {
@@ -14,33 +15,40 @@ function ev(id: string): NetworkEvent {
   };
 }
 
+function newBus(): NetworkEventBus {
+  return new NetworkEventBus({ log: newNoop() });
+}
+
 Deno.test("subscribe delivers, unsubscribe stops delivery", () => {
+  const bus = newBus();
   const received: string[] = [];
-  const unsub = networkEventBus.subscribe((e) => received.push(e.id));
-  networkEventBus.publish(ev("a"));
-  networkEventBus.publish(ev("b"));
+  const unsub = bus.subscribe((e) => received.push(e.id));
+  bus.publish(ev("a"));
+  bus.publish(ev("b"));
   unsub();
-  networkEventBus.publish(ev("c"));
+  bus.publish(ev("c"));
   assertEquals(received, ["a", "b"]);
 });
 
 Deno.test("publish survives a throwing listener", () => {
+  const bus = newBus();
   const received: string[] = [];
-  const u1 = networkEventBus.subscribe(() => {
+  const u1 = bus.subscribe(() => {
     throw new Error("boom");
   });
-  const u2 = networkEventBus.subscribe((e) => received.push(e.id));
-  networkEventBus.publish(ev("x"));
+  const u2 = bus.subscribe((e) => received.push(e.id));
+  bus.publish(ev("x"));
   u1();
   u2();
   assertEquals(received, ["x"]);
 });
 
 Deno.test("listenerCount reflects subscriptions", () => {
-  const u1 = networkEventBus.subscribe(() => {});
-  const u2 = networkEventBus.subscribe(() => {});
-  assertEquals(networkEventBus.listenerCount(), 2);
+  const bus = newBus();
+  const u1 = bus.subscribe(() => {});
+  const u2 = bus.subscribe(() => {});
+  assertEquals(bus.listenerCount(), 2);
   u1();
   u2();
-  assertEquals(networkEventBus.listenerCount(), 0);
+  assertEquals(bus.listenerCount(), 0);
 });
