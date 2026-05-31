@@ -1,5 +1,6 @@
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
 import { networkState } from "@/core/state/store.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { fetchCouncilTopology } from "./council-fetch.ts";
 import { rescanRollingWindow } from "./soroban-watcher.ts";
 import { refreshWasmRegistry } from "./wasm-registry.ts";
@@ -17,34 +18,42 @@ import { refreshWasmRegistry } from "./wasm-registry.ts";
 
 let inFlight: Promise<void> | null = null;
 
-export function refreshTopology(reason: string): Promise<void> {
+export function refreshTopology(
+  reason: string,
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
   if (inFlight) return inFlight;
-  inFlight = run(reason).finally(() => {
+  inFlight = run(reason, deps).finally(() => {
     inFlight = null;
   });
   return inFlight;
 }
 
-async function run(reason: string): Promise<void> {
+async function run(
+  reason: string,
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
+  const log = deps.log.scope("topologyRefresh");
+  log.info("refreshTopology");
+  log.debug("reason", reason);
+
   try {
     // Re-fetch the wasm-hash registry alongside the topology so any new
     // soroban-core release becomes recognised within an hour without a
     // dashboard-backend restart. Errors are absorbed by the registry
     // itself — they don't block the topology refresh.
-    await refreshWasmRegistry();
-    const topology = await fetchCouncilTopology();
+    log.event("refreshing WASM registry");
+    await refreshWasmRegistry({ log });
+    log.event("fetching council topology");
+    const topology = await fetchCouncilTopology({ log });
     networkState.replaceTopology(topology);
-    await rescanRollingWindow();
-    LOG.info("Topology refreshed", {
-      reason,
-      councils: networkState.getCouncilIds().length,
-      providers: networkState.countActiveProviders(),
-      assets: networkState.countAssetsRegistered(),
-    });
+    log.event("topology replaced in network state");
+    await rescanRollingWindow({ log, bus: deps.bus });
+    log.debug("councils", networkState.getCouncilIds().length);
+    log.debug("providers", networkState.countActiveProviders());
+    log.debug("assets", networkState.countAssetsRegistered());
+    log.event("topology refreshed");
   } catch (err) {
-    LOG.warn("Topology refresh failed", {
-      reason,
-      error: err instanceof Error ? err.message : String(err),
-    });
+    log.error(err, "topology refresh failed");
   }
 }

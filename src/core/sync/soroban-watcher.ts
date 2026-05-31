@@ -1,8 +1,8 @@
 import { Server } from "stellar-sdk/rpc";
-import { LOG } from "@/config/logger.ts";
+import type { Logger } from "@/utils/logger/index.ts";
 import { STELLAR_RPC_URL } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
-import { networkEventBus } from "@/core/events/bus.ts";
+import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { mapChainEvent, type RawChainEvent } from "./event-mapper.ts";
 import {
   CONTRACT_INITIALIZED_TOPIC_PATTERN,
@@ -59,17 +59,25 @@ function watchedContractIds(): string[] {
   return Array.from(ids);
 }
 
-function publish(
+function publishMappedEvent(
   event: ReturnType<typeof mapChainEvent>,
   ledgerClosedAtMs: number | null,
+  bus: NetworkEventBus,
+  log: Logger,
 ): void {
+  log.info("publishMappedEvent");
   if (!event) return;
+  log.debug("kind", event.kind);
   const latencyMs = ledgerClosedAtMs === null
     ? null
     : Math.max(0, Date.now() - ledgerClosedAtMs);
   const wasNew = networkState.recordEvent(event, latencyMs);
-  if (!wasNew) return;
-  networkEventBus.publish(event);
+  if (!wasNew) {
+    log.event("event already seen, skipping publish");
+    return;
+  }
+  log.event("publishing event to bus");
+  bus.publish(event);
 }
 
 /**
@@ -88,7 +96,12 @@ type ProcessedEvent = {
   ledgerClosedAtMs: number | null;
 };
 
-function processRawEventBatch(raws: RawChainEvent[]): ProcessedEvent[] {
+function processRawEventBatch(
+  raws: RawChainEvent[],
+  log: Logger,
+): ProcessedEvent[] {
+  log.info("processRawEventBatch");
+  log.debug("rawCount", raws.length);
   const byTx = new Map<string, ProcessedEvent[]>();
   const txOrder: string[] = [];
   for (const raw of raws) {
@@ -127,20 +140,6 @@ function processRawEventBatch(raws: RawChainEvent[]): ProcessedEvent[] {
 }
 
 /**
- * Cold-start scan: walk trailing 24h on the current contractId set,
- * map events, and seed the rolling window + ring buffer in chronological
- * order. Sets the forward cursor to one past the latest ledger seen.
- */
-function describeErr(err: unknown): string {
-  if (err instanceof Error) return err.message;
-  try {
-    return JSON.stringify(err);
-  } catch {
-    return String(err);
-  }
-}
-
-/**
  * Parse Soroban's `ledgerClosedAt` (ISO string) to ms-since-epoch. Older
  * SDK responses may omit it; in that case latency stays null for the event.
  */
@@ -156,12 +155,22 @@ function parseLedgerClosedAt(raw: unknown): number | null {
  * null if the error doesn't match that pattern.
  */
 function parseValidRangeFloor(err: unknown): number | null {
-  const msg = describeErr(err);
+  const msg = err instanceof Error ? err.message : String(err);
   const match = msg.match(/ledger range:\s*(\d+)\s*-\s*\d+/);
   return match ? Number(match[1]) : null;
 }
 
-export async function coldStartScan(): Promise<void> {
+/**
+ * Cold-start scan: walk trailing 24h on the current contractId set,
+ * map events, and seed the rolling window + ring buffer in chronological
+ * order. Sets the forward cursor to one past the latest ledger seen.
+ */
+export async function coldStartScan(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
+  const log = deps.log.scope("coldStartScan");
+  log.info("coldStartScan");
+
   const server = getServer();
   const latest = await server.getLatestLedger();
   // Soroban's *event* retention is much shorter than its ledger retention
@@ -187,28 +196,25 @@ export async function coldStartScan(): Promise<void> {
       if (probe.events.length > 0) {
         initialStart = tryStart;
         if (back !== LOOKBACK_LEDGERS_24H) {
-          LOG.info("Cold-start scan clamped to events retention floor", {
-            desiredStart,
-            workingStart: tryStart,
-            lookbackLedgers: back,
-          });
+          log.debug("desiredStart", desiredStart);
+          log.debug("workingStart", tryStart);
+          log.debug("lookbackLedgers", back);
+          log.event("cold-start scan clamped to events retention floor");
         }
         break;
       }
     } catch (err) {
-      LOG.debug("Cold-start probe failed at lookback", {
-        back,
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.debug("back", back);
+      log.error(err, "cold-start probe failed at lookback");
     }
   }
   const contractIds = watchedContractIds();
 
   if (contractIds.length === 0) {
     lastLedgerSeen = latest.sequence;
-    LOG.info(
-      "Cold-start scan skipped — no contracts to watch yet (no councils registered).",
-      { latestLedger: latest.sequence },
+    log.debug("latestLedger", latest.sequence);
+    log.event(
+      "cold-start scan skipped — no contracts to watch yet (no councils registered)",
     );
     return;
   }
@@ -217,11 +223,10 @@ export async function coldStartScan(): Promise<void> {
   // the forward poller with a null cursor.
   lastLedgerSeen = latest.sequence;
 
-  LOG.info("Cold-start scan starting", {
-    startLedger: initialStart,
-    latestLedger: latest.sequence,
-    contractCount: contractIds.length,
-  });
+  log.debug("startLedger", initialStart);
+  log.debug("latestLedger", latest.sequence);
+  log.debug("contractCount", contractIds.length);
+  log.event("cold-start scan starting");
 
   const rawBatch: RawChainEvent[] = [];
 
@@ -246,10 +251,11 @@ export async function coldStartScan(): Promise<void> {
         // First-page out-of-range failure: retry once at the RPC's valid floor.
         const floor = page === 0 ? parseValidRangeFloor(err) : null;
         if (floor !== null && floor > nextLedger) {
-          LOG.warn("Cold-start scan startLedger below retention; retrying", {
-            requestedStartLedger: nextLedger,
-            retentionFloor: floor,
-          });
+          log.debug("requestedStartLedger", nextLedger);
+          log.debug("retentionFloor", floor);
+          log.event(
+            "cold-start scan startLedger below retention; retrying at floor",
+          );
           nextLedger = floor;
           try {
             res = await server.getEvents({
@@ -258,19 +264,15 @@ export async function coldStartScan(): Promise<void> {
               limit: PAGE_LIMIT,
             });
           } catch (err2) {
-            LOG.warn("Cold-start scan retry at retention floor failed", {
-              startLedger: nextLedger,
-              error: describeErr(err2),
-            });
+            log.debug("startLedger", nextLedger);
+            log.error(err2, "cold-start scan retry at retention floor failed");
             break;
           }
         } else {
-          LOG.warn("Cold-start scan page failed (stopping chunk)", {
-            page,
-            startLedger: nextLedger,
-            chunkSize: chunk.length,
-            error: describeErr(err),
-          });
+          log.debug("page", page);
+          log.debug("startLedger", nextLedger);
+          log.debug("chunkSize", chunk.length);
+          log.error(err, "cold-start scan page failed (stopping chunk)");
           break;
         }
       }
@@ -292,10 +294,9 @@ export async function coldStartScan(): Promise<void> {
       const lastLedgerInPage = res.events[res.events.length - 1].ledger;
       nextLedger = lastLedgerInPage + 1;
       if (page >= 50) {
-        LOG.warn("Cold-start scan hit page cap (50) for chunk; stopping", {
-          eventsSoFar: rawBatch.length,
-          chunkSize: chunk.length,
-        });
+        log.debug("eventsSoFar", rawBatch.length);
+        log.debug("chunkSize", chunk.length);
+        log.event("cold-start scan hit page cap (50) for chunk; stopping");
         break;
       }
     }
@@ -308,20 +309,24 @@ export async function coldStartScan(): Promise<void> {
   // events grouped per chunk, so re-sort by ledger here to keep the
   // ring-buffer chronological.
   rawBatch.sort((a, b) => a.ledger - b.ledger);
-  const chronological = processRawEventBatch(rawBatch).map((p) => p.event);
+  const chronological = processRawEventBatch(rawBatch, log).map((p) => p.event);
   networkState.seedWindow(chronological);
   // Recent ring buffer: keep newest at index 0.
   const newestFirst = [...chronological].reverse();
   networkState.seedRecent(newestFirst);
-  LOG.info("Cold-start scan complete", {
-    pagesWalked: page,
-    eventsSeeded: chronological.length,
-    lastLedgerSeen,
-  });
+
+  log.debug("pagesWalked", page);
+  log.debug("eventsSeeded", chronological.length);
+  log.debug("lastLedgerSeen", lastLedgerSeen);
+  log.event("cold-start scan complete");
 }
 
-async function pollTick(): Promise<void> {
+async function pollTick(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
   if (!running || lastLedgerSeen === null) return;
+  const log = deps.log.scope("pollTick");
+
   const contractIds = watchedContractIds();
 
   // Soroban's getEvents intersects multiple filter entries within a single
@@ -361,10 +366,8 @@ async function pollTick(): Promise<void> {
         });
       }
     } catch (err) {
-      LOG.warn("Soroban poll (known contracts) failed", {
-        chunkSize: chunk.length,
-        error: describeErr(err),
-      });
+      log.debug("chunkSize", chunk.length);
+      log.error(err, "Soroban poll (known contracts) failed");
     }
   }
 
@@ -388,61 +391,64 @@ async function pollTick(): Promise<void> {
         unknownCandidates.add(cid);
       }
     } catch (err) {
-      LOG.warn("Soroban poll (contract_initialized) failed", {
-        error: err instanceof Error ? err.message : String(err),
-      });
+      log.error(err, "Soroban poll (contract_initialized) failed");
     }
   }
 
-  for (const processed of processRawEventBatch(rawBatch)) {
-    publish(processed.event, processed.ledgerClosedAtMs);
+  for (const processed of processRawEventBatch(rawBatch, log)) {
+    publishMappedEvent(
+      processed.event,
+      processed.ledgerClosedAtMs,
+      deps.bus,
+      log,
+    );
   }
   for (const cid of unknownCandidates) {
-    evaluateUnknownContract(cid).catch((err) => {
-      LOG.warn("evaluateUnknownContract failed", {
-        contractId: cid,
-        error: err instanceof Error ? err.message : String(err),
-      });
+    evaluateUnknownContract(cid, deps).catch((err) => {
+      log.debug("contractId", cid);
+      log.error(err, "evaluateUnknownContract failed");
     });
   }
   // Retry any matched-but-not-yet-registered contracts. No-op when nothing
   // is pending, so this is cheap when council-platform is caught up.
-  drainPendingAdoptions().catch((err) => {
-    LOG.warn("drainPendingAdoptions failed", {
-      error: err instanceof Error ? err.message : String(err),
-    });
+  drainPendingAdoptions(deps).catch((err) => {
+    log.error(err, "drainPendingAdoptions failed");
   });
   lastLedgerSeen = nextLastLedger;
 }
 
-function scheduleNext(): void {
+function scheduleNext(deps: { log: Logger; bus: NetworkEventBus }): void {
   if (!running) return;
   pollTimer = setTimeout(async () => {
-    await pollTick();
-    scheduleNext();
+    await pollTick(deps);
+    scheduleNext(deps);
   }, POLL_INTERVAL_MS) as unknown as number;
 }
 
-export function startSorobanWatcher(): void {
+export function startSorobanWatcher(
+  deps: { log: Logger; bus: NetworkEventBus },
+): void {
   if (running) return;
   running = true;
-  LOG.info("Soroban watcher started", {
-    intervalMs: POLL_INTERVAL_MS,
-    lastLedgerSeen,
-  });
-  scheduleNext();
+  const log = deps.log.scope("sorobanWatcher");
+  log.debug("intervalMs", POLL_INTERVAL_MS);
+  log.debug("lastLedgerSeen", lastLedgerSeen);
+  log.event("soroban watcher started");
+  scheduleNext(deps);
 }
 
-export function stopSorobanWatcher(): void {
+export function stopSorobanWatcher(deps: { log: Logger }): void {
   running = false;
   if (pollTimer !== null) {
     clearTimeout(pollTimer);
     pollTimer = null;
   }
-  LOG.info("Soroban watcher stopped");
+  deps.log.scope("sorobanWatcher").event("soroban watcher stopped");
 }
 
 /** Re-anchor the rolling 24h counter window after the hourly re-sync. */
-export async function rescanRollingWindow(): Promise<void> {
-  await coldStartScan();
+export async function rescanRollingWindow(
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
+  await coldStartScan(deps);
 }
