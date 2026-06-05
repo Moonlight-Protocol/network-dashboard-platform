@@ -8,7 +8,24 @@ import {
   type ServerFrame,
 } from "@/core/events/types.ts";
 
-const IDLE_TIMEOUT_SECONDS = 30;
+/**
+ * Deno's `idleTimeout` closes the WebSocket when neither side has sent
+ * data for this many seconds. The SPA receives the snapshot frame
+ * immediately on open, then nothing until the first chain event maps
+ * to a NetworkEvent — which can easily exceed 30 s on a quiet network
+ * or during a fresh deploy that does most of its work before the first
+ * SAC event lands.
+ *
+ * 30 s caused programmatic subscribers (the events-capture harness in
+ * `local-dev/testnet/events-capture/`) to lose the back-fill burst that
+ * follows a new-council adoption: `council_formed` and `provider_added`
+ * publish 25-40 s after deploy, so the WS was already closed by the
+ * time `bus.publish` fired.
+ *
+ * 300 s gives plenty of headroom for slow flows. SPA reconnect-on-close
+ * behaviour stays unchanged — this only widens the inactivity window.
+ */
+const IDLE_TIMEOUT_SECONDS = 300;
 
 /**
  * Public WebSocket for the network-dashboard ticker.
