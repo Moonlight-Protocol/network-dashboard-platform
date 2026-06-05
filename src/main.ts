@@ -13,26 +13,25 @@ import {
   stopSorobanWatcher,
 } from "@/core/sync/soroban-watcher.ts";
 import { startScheduler, stopScheduler } from "@/core/sync/scheduler.ts";
-import { refreshWasmRegistry } from "@/core/sync/wasm-registry.ts";
 
 /**
  * Bootstrap order:
- *   1. Fetch the Channel Auth WASM hash registry from soroban-core's
- *      GitHub releases. The new-council listener short-circuits to a
- *      no-op until this returns a non-empty set, so we do it before the
- *      Soroban watcher starts.
- *   2. Fetch council-platform topology → populate linkage maps so the
+ *   1. Fetch council-platform topology → populate linkage maps so the
  *      Soroban watcher knows which contractIds to subscribe to.
- *   3. Cold-start scan: walk trailing 24h on those contracts to seed the
+ *   2. Cold-start scan: walk trailing 24h on those contracts to seed the
  *      rolling counter window + activity-feed ring buffer.
- *   4. Start the forward poller (Soroban watcher).
- *   5. Start the scheduler (hourly re-sync + minute window sweep).
- *   6. Start the HTTP server.
+ *   3. Start the forward poller (Soroban watcher). It also polls
+ *      Soroban-wide for `contract_initialized` events from unknown
+ *      contracts and feeds them to the contract-init-listener, which
+ *      triggers an immediate topology refresh on each unknown — this
+ *      replaces the hourly periodic re-sync.
+ *   4. Start the scheduler (minute window sweep only).
+ *   5. Start the HTTP server.
  *
- * Steps 1–3 are best-effort: a failure logs + continues so the service
+ * Steps 1-2 are best-effort: a failure logs + continues so the service
  * still serves a (degraded) snapshot rather than refusing to boot. The
- * hourly re-sync re-fetches both the WASM registry and the topology so
- * a boot-time outage self-heals.
+ * event-driven new-council path self-heals as soon as Soroban polling
+ * succeeds.
  */
 async function bootstrap() {
   const rootLog = createLogger();
@@ -43,15 +42,6 @@ async function bootstrap() {
   const deps = { log: rootLog, bus };
 
   try {
-    try {
-      await refreshWasmRegistry({ log: rootLog });
-    } catch (err) {
-      log.error(
-        err,
-        "initial WASM registry fetch failed (continuing degraded)",
-      );
-    }
-
     try {
       const topology = await fetchCouncilTopology({ log: rootLog });
       networkState.replaceTopology(topology);
