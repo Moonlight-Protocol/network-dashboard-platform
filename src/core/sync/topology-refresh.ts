@@ -2,17 +2,24 @@ import type { Logger } from "@/utils/logger/index.ts";
 import { networkState } from "@/core/state/store.ts";
 import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { fetchCouncilTopology } from "./council-fetch.ts";
-import { rescanRollingWindow } from "./soroban-watcher.ts";
 
 /**
  * Single-flight topology refresh: pull the latest council list from
- * council-platform, replace the in-memory topology, then re-walk the
- * trailing 24h with the new contractId filter so any historical events
- * from the new councils land in the rolling window + ring buffer.
+ * council-platform and replace the in-memory topology.
+ *
+ * The caller is responsible for any catch-up of historical events for
+ * newly-adopted contracts (via `backfillFromLedger` in `soroban-watcher`).
+ * We deliberately do NOT call `rescanRollingWindow` here: that helper
+ * runs `coldStartScan` which `seedRecent`s the ring buffer with
+ * cold-scanned events, and `publishMappedEvent`'s dedup check uses that
+ * ring buffer — so a `rescanRollingWindow` call followed by a back-fill
+ * would silently dedup every back-filled event before it could reach the
+ * bus. The contract-init-listener path relies on `backfillFromLedger` to
+ * fan out the historical-but-newly-relevant events live.
  *
  * Concurrent calls coalesce — the contract-init listener can fire several
  * candidates from a single poll tick and we don't want a thundering herd
- * of council-platform fetches or overlapping Soroban scans.
+ * of council-platform fetches.
  */
 
 let inFlight: Promise<void> | null = null;
@@ -41,7 +48,6 @@ async function run(
     const topology = await fetchCouncilTopology({ log });
     networkState.replaceTopology(topology);
     log.event("topology replaced in network state");
-    await rescanRollingWindow({ log, bus: deps.bus });
     log.debug("councils", networkState.getCouncilIds().length);
     log.debug("providers", networkState.countActiveProviders());
     log.debug("assets", networkState.countAssetsRegistered());
