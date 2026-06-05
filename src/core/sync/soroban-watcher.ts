@@ -8,7 +8,6 @@ import {
   CONTRACT_INITIALIZED_TOPIC_PATTERN,
   drainPendingAdoptions,
   evaluateUnknownContract,
-  isContractInitListenerEnabled,
 } from "./contract-init-listener.ts";
 
 const POLL_INTERVAL_MS = 5_000;
@@ -371,28 +370,32 @@ async function pollTick(
     }
   }
 
-  if (isContractInitListenerEnabled()) {
-    try {
-      const res = await server.getEvents({
-        startLedger,
-        filters: [{
-          type: "contract",
-          topics: [CONTRACT_INITIALIZED_TOPIC_PATTERN],
-        }],
-        limit: PAGE_LIMIT,
-      });
-      nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
-      for (const ev of res.events) {
-        const cid = ev.contractId?.toString() ?? "";
-        if (!cid) continue;
-        // Already-known contracts are handled by the contractIds-filter
-        // call above (which carries full event data); skip the duplicate.
-        if (knownIds.has(cid)) continue;
-        unknownCandidates.add(cid);
-      }
-    } catch (err) {
-      log.error(err, "Soroban poll (contract_initialized) failed");
+  // Always poll for fresh `contract_initialized` events from contracts
+  // outside the watched set. This is the event-driven new-council
+  // discovery path — the listener no longer gates on a WASM-hash
+  // registry, so local-dev environments without GitHub access for the
+  // soroban-core releases listing still discover new councils as they
+  // deploy.
+  try {
+    const res = await server.getEvents({
+      startLedger,
+      filters: [{
+        type: "contract",
+        topics: [CONTRACT_INITIALIZED_TOPIC_PATTERN],
+      }],
+      limit: PAGE_LIMIT,
+    });
+    nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
+    for (const ev of res.events) {
+      const cid = ev.contractId?.toString() ?? "";
+      if (!cid) continue;
+      // Already-known contracts are handled by the contractIds-filter
+      // call above (which carries full event data); skip the duplicate.
+      if (knownIds.has(cid)) continue;
+      unknownCandidates.add(cid);
     }
+  } catch (err) {
+    log.error(err, "Soroban poll (contract_initialized) failed");
   }
 
   for (const processed of processRawEventBatch(rawBatch, log)) {
@@ -404,14 +407,17 @@ async function pollTick(
     );
   }
   for (const cid of unknownCandidates) {
-    evaluateUnknownContract(cid, deps).catch((err) => {
-      log.debug("contractId", cid);
-      log.error(err, "evaluateUnknownContract failed");
-    });
+    evaluateUnknownContract(cid, startLedger, deps);
   }
-  // Retry any matched-but-not-yet-registered contracts. No-op when nothing
-  // is pending, so this is cheap when council-platform is caught up.
-  drainPendingAdoptions(deps).catch((err) => {
+  // Refresh topology once if there's anything pending, then adopt
+  // (or cache as not-ours) each unknown. On adoption, back-fill from the
+  // earliest observed-at-ledger across the freshly-adopted contracts so
+  // events emitted between deploy and adoption (e.g. provider_added) are
+  // still published live.
+  drainPendingAdoptions({
+    ...deps,
+    backfillFromLedger,
+  }).catch((err) => {
     log.error(err, "drainPendingAdoptions failed");
   });
   lastLedgerSeen = nextLastLedger;
@@ -451,4 +457,86 @@ export async function rescanRollingWindow(
   deps: { log: Logger; bus: NetworkEventBus },
 ): Promise<void> {
   await coldStartScan(deps);
+}
+
+/**
+ * Back-fill scan invoked after a newly-discovered Channel Auth contract is
+ * adopted into the topology. Walks the current `watchedContractIds()` set
+ * from `fromLedger` forward, maps each event, and publishes via the bus.
+ * Dedup is handled by `networkState.recordEvent` in `publishMappedEvent` —
+ * events the forward poller has already published are skipped, so calling
+ * this concurrently with `pollTick` is safe.
+ *
+ * The scan covers ALL watched contracts (not just the newly-adopted ones)
+ * because some events involving a fresh council fire on a SHARED contract
+ * — e.g. the XLM SAC `transfer` and `fee` events fan out across every
+ * council and need to be mapped via the contract-id linkage that
+ * `refreshTopology` just installed.
+ */
+export async function backfillFromLedger(
+  fromLedger: number,
+  deps: { log: Logger; bus: NetworkEventBus },
+): Promise<void> {
+  const log = deps.log.scope("backfillFromLedger");
+  log.info("backfillFromLedger");
+  log.debug("fromLedger", fromLedger);
+
+  const contractIds = watchedContractIds();
+  if (contractIds.length === 0) {
+    log.event("back-fill skipped — no contracts watched");
+    return;
+  }
+
+  const server = getServer();
+  const rawBatch: RawChainEvent[] = [];
+  for (const chunk of chunkContractIds(contractIds)) {
+    let nextLedger = fromLedger;
+    let page = 0;
+    while (true) {
+      let res;
+      try {
+        res = await server.getEvents({
+          startLedger: nextLedger,
+          filters: [{ type: "contract", contractIds: chunk }],
+          limit: PAGE_LIMIT,
+        });
+      } catch (err) {
+        log.debug("chunkSize", chunk.length);
+        log.debug("startLedger", nextLedger);
+        log.error(err, "back-fill page failed");
+        break;
+      }
+      page++;
+      for (const ev of res.events) {
+        rawBatch.push({
+          id: ev.id,
+          contractId: ev.contractId?.toString() ?? "",
+          ledger: ev.ledger,
+          topics: ev.topic,
+          value: ev.value,
+          txHash: ev.txHash ?? "",
+          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
+        });
+      }
+      if (res.events.length < PAGE_LIMIT) break;
+      nextLedger = res.events[res.events.length - 1].ledger + 1;
+      if (page >= 50) {
+        log.debug("eventsSoFar", rawBatch.length);
+        log.event("back-fill page cap (50) reached for chunk; stopping");
+        break;
+      }
+    }
+  }
+
+  rawBatch.sort((a, b) => a.ledger - b.ledger);
+  log.debug("rawCount", rawBatch.length);
+  for (const processed of processRawEventBatch(rawBatch, log)) {
+    publishMappedEvent(
+      processed.event,
+      processed.ledgerClosedAtMs,
+      deps.bus,
+      log,
+    );
+  }
+  log.event("back-fill scan complete");
 }

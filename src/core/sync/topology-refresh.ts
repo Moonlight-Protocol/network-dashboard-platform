@@ -3,7 +3,6 @@ import { networkState } from "@/core/state/store.ts";
 import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { fetchCouncilTopology } from "./council-fetch.ts";
 import { rescanRollingWindow } from "./soroban-watcher.ts";
-import { refreshWasmRegistry } from "./wasm-registry.ts";
 
 /**
  * Single-flight topology refresh: pull the latest council list from
@@ -38,12 +37,6 @@ async function run(
   log.debug("reason", reason);
 
   try {
-    // Re-fetch the wasm-hash registry alongside the topology so any new
-    // soroban-core release becomes recognised within an hour without a
-    // dashboard-backend restart. Errors are absorbed by the registry
-    // itself — they don't block the topology refresh.
-    log.event("refreshing WASM registry");
-    await refreshWasmRegistry({ log });
     log.event("fetching council topology");
     const topology = await fetchCouncilTopology({ log });
     networkState.replaceTopology(topology);
