@@ -75,6 +75,22 @@ function publishMappedEvent(
     log.event("event already seen, skipping publish");
     return;
   }
+  // Surgically reflect membership-changing chain events into the
+  // in-memory linkage maps so the very next downstream lookup
+  // (e.g. `mapSacFeeEvent` resolving the payer's council on the
+  // immediately-following send bundle) sees the new state. The next
+  // topology refresh will overwrite with the same value — safe.
+  if (event.kind === "provider_added") {
+    const pp = event.payload.providerPublicKey;
+    if (typeof pp === "string") {
+      networkState.registerProvider(pp, event.councilId);
+    }
+  } else if (event.kind === "provider_removed") {
+    const pp = event.payload.providerPublicKey;
+    if (typeof pp === "string") {
+      networkState.unregisterProvider(pp);
+    }
+  }
   log.event("publishing event to bus");
   bus.publish(event);
 }

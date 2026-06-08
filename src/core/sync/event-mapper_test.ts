@@ -126,3 +126,107 @@ Deno.test("mapSacFeeEvent returns null when payer is not a registered PP", () =>
   const mapped = mapChainEvent(feeEvent(STRANGER));
   assertEquals(mapped, null);
 });
+
+Deno.test(
+  "registerProvider makes a late-joining PP visible to mapSacFeeEvent without a topology refresh",
+  () => {
+    networkState.__resetForTests();
+    // Boot-time topology has the council but no providers yet — exactly
+    // the state n-d-p is in when the test's PP joins AFTER the
+    // contract-init listener's refresh.
+    networkState.replaceTopology([
+      {
+        id: COUNCIL_1,
+        name: "Council 1",
+        providers: [],
+        channels: [{
+          contractId: CHANNEL_1,
+          assetCode: "XLM",
+          assetContractId: SAC,
+        }],
+        jurisdictions: [],
+      },
+    ]);
+
+    // Pre-condition: SAC-fee event from the PP is dropped — PP unknown.
+    assertEquals(mapChainEvent(feeEvent(PP_A)), null);
+
+    // Watcher observes `provider_added` on-chain and calls this.
+    networkState.registerProvider(PP_A, COUNCIL_1);
+
+    // Now the immediately-following send bundle's SAC-fee event lands.
+    const mapped = mapChainEvent(feeEvent(PP_A));
+    assertEquals(mapped?.kind, "channel_bundle");
+    assertEquals(mapped?.councilId, COUNCIL_1);
+  },
+);
+
+Deno.test(
+  "unregisterProvider drops a removed PP from mapSacFeeEvent attribution",
+  () => {
+    networkState.__resetForTests();
+    networkState.replaceTopology([
+      {
+        id: COUNCIL_1,
+        name: "Council 1",
+        providers: [{ publicKey: PP_A, label: null }],
+        channels: [{
+          contractId: CHANNEL_1,
+          assetCode: "XLM",
+          assetContractId: SAC,
+        }],
+        jurisdictions: [],
+      },
+    ]);
+
+    // Pre-condition: registered PP → channel_bundle lands.
+    assertEquals(mapChainEvent(feeEvent(PP_A))?.kind, "channel_bundle");
+
+    // Watcher observes `provider_removed` and calls this.
+    networkState.unregisterProvider(PP_A);
+
+    // Now SAC-fee events for the removed PP are dropped.
+    assertEquals(mapChainEvent(feeEvent(PP_A)), null);
+  },
+);
+
+Deno.test(
+  "registerProvider is idempotent — a later replaceTopology overwriting the same value is safe",
+  () => {
+    networkState.__resetForTests();
+    networkState.replaceTopology([
+      {
+        id: COUNCIL_1,
+        name: "Council 1",
+        providers: [],
+        channels: [{
+          contractId: CHANNEL_1,
+          assetCode: "XLM",
+          assetContractId: SAC,
+        }],
+        jurisdictions: [],
+      },
+    ]);
+
+    networkState.registerProvider(PP_A, COUNCIL_1);
+    assertEquals(mapChainEvent(feeEvent(PP_A))?.kind, "channel_bundle");
+
+    // Council-platform catches up; the scheduled topology refresh runs.
+    networkState.replaceTopology([
+      {
+        id: COUNCIL_1,
+        name: "Council 1",
+        providers: [{ publicKey: PP_A, label: null }],
+        channels: [{
+          contractId: CHANNEL_1,
+          assetCode: "XLM",
+          assetContractId: SAC,
+        }],
+        jurisdictions: [],
+      },
+    ]);
+
+    // Still works — the refresh wrote the same value.
+    assertEquals(mapChainEvent(feeEvent(PP_A))?.kind, "channel_bundle");
+  },
+);
