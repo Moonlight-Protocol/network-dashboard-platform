@@ -14,7 +14,6 @@ primary_region = 'ams'
 
   # STELLAR
   NETWORK = 'testnet'
-  STELLAR_RPC_URL = 'https://soroban-testnet.stellar.org'
 
   # OPENTELEMETRY
   OTEL_DENO = 'true'
