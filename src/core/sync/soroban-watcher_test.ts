@@ -1,9 +1,25 @@
 import { assertEquals } from "@std/assert";
-import { publishMappedEvent } from "./soroban-watcher.ts";
-import { networkState } from "@/core/state/store.ts";
-import { NetworkEventBus } from "@/core/events/bus.ts";
-import { newNoop } from "@/utils/logger/index.ts";
 import type { NetworkEvent } from "@/core/events/types.ts";
+
+// `soroban-watcher.ts` transitively imports `src/config/env.ts`, which
+// `require("NETWORK")`s at module-load time. In CI those env vars are
+// not set (locally they leak in from the shell), so a static `import`
+// throws before any test runs. Static `import` can't be guarded; set the
+// env vars first and dynamically import.
+Deno.env.set("NETWORK", "testnet");
+Deno.env.set(
+  "STELLAR_RPC_URL",
+  "https://soroban-testnet.stellar.org",
+);
+Deno.env.set(
+  "COUNCIL_PLATFORM_URL",
+  "https://council-api-testnet.moonlightprotocol.io",
+);
+
+const { publishMappedEvent } = await import("./soroban-watcher.ts");
+const { networkState } = await import("@/core/state/store.ts");
+const { NetworkEventBus } = await import("@/core/events/bus.ts");
+const { newNoop } = await import("@/utils/logger/index.ts");
 
 const COUNCIL = "CCVYCJF7ONC4DHYKI34XINUVBBISAMFOD7N4SRRZS2JE2IFBWNUDVMRI";
 const PP = "GAR2WBIXBOXP3GA7XNVOSEIB3QL2OZJRT2QSX24UJFTDVI26M23MEP25";
