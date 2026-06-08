@@ -148,6 +148,29 @@ export class NetworkStateStore {
     return this.providerToCouncil.get(publicKey);
   }
 
+  /**
+   * Surgical, idempotent insert into the providerToCouncil map. Called by
+   * the watcher when a `provider_added` chain event is observed, so a PP
+   * that joins a council AFTER the last `replaceTopology` is still
+   * resolvable on the next SAC-fee event (otherwise `mapSacFeeEvent`
+   * drops the bundle for the entire window between PP join and the next
+   * topology refresh). Re-running `replaceTopology` later overwrites with
+   * the same value — safe.
+   */
+  registerProvider(publicKey: string, councilId: string): void {
+    this.providerToCouncil.set(publicKey, councilId);
+  }
+
+  /**
+   * Counterpart to `registerProvider` — called on `provider_removed`. A
+   * later `replaceTopology` will not re-add the PP because
+   * council-platform's `/public/councils` only lists active providers
+   * (`providerRepo.listActive`).
+   */
+  unregisterProvider(publicKey: string): void {
+    this.providerToCouncil.delete(publicKey);
+  }
+
   topologySnapshot(): CouncilTopologyEntry[] {
     return Array.from(this.councils.values()).map((c) => ({
       ...c,
