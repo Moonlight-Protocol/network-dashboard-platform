@@ -2,7 +2,7 @@ import { Application } from "@oak/oak";
 
 import { buildApiRouter } from "@/http/v1/v1.routes.ts";
 import { corsMiddleware } from "@/http/middleware/cors.ts";
-import { PORT } from "@/config/env.ts";
+import { getPort } from "@/config/env.ts";
 import { createLogger } from "@/config/logger.ts";
 import { NetworkEventBus } from "@/core/events/bus.ts";
 import { networkState } from "@/core/state/store.ts";
@@ -67,8 +67,9 @@ async function bootstrap() {
     app.use(apiV1.routes());
     app.use(apiV1.allowedMethods());
 
-    log.debug("port", PORT);
-    log.event(`network-dashboard-platform running on http://localhost:${PORT}`);
+    const port = getPort();
+    log.debug("port", port);
+    log.event(`network-dashboard-platform running on http://localhost:${port}`);
 
     const shutdown = () => {
       log.event("shutting down");
@@ -79,7 +80,7 @@ async function bootstrap() {
     Deno.addSignalListener("SIGINT", shutdown);
     Deno.addSignalListener("SIGTERM", shutdown);
 
-    await app.listen({ port: PORT });
+    await app.listen({ port });
   } catch (err) {
     log.error(err, "failed to start");
     stopSorobanWatcher({ log: rootLog });

@@ -1,6 +1,6 @@
 import { Server } from "stellar-sdk/rpc";
 import type { Logger } from "@/utils/logger/index.ts";
-import { STELLAR_RPC_URL } from "@/config/env.ts";
+import { getStellarRpcUrl } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
 import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { mapChainEvent, type RawChainEvent } from "./event-mapper.ts";
@@ -35,8 +35,9 @@ function chunkContractIds(ids: string[]): string[][] {
 let rpcServer: Server | null = null;
 function getServer(): Server {
   if (!rpcServer) {
-    rpcServer = new Server(STELLAR_RPC_URL, {
-      allowHttp: STELLAR_RPC_URL.startsWith("http://"),
+    const url = getStellarRpcUrl();
+    rpcServer = new Server(url, {
+      allowHttp: url.startsWith("http://"),
     });
   }
   return rpcServer;

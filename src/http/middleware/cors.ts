@@ -1,11 +1,11 @@
 import type { Context, Next } from "@oak/oak";
-import { ALLOWED_ORIGINS, MODE } from "@/config/env.ts";
+import { getAllowedOrigins, getMode } from "@/config/env.ts";
 
 const LOCALHOST_ORIGIN = /^https?:\/\/localhost(:\d+)?$/;
 
 function isAllowed(origin: string): boolean {
-  if (ALLOWED_ORIGINS.includes(origin)) return true;
-  if (MODE === "development" && LOCALHOST_ORIGIN.test(origin)) return true;
+  if (getAllowedOrigins().includes(origin)) return true;
+  if (getMode() === "development" && LOCALHOST_ORIGIN.test(origin)) return true;
   return false;
 }
 
@@ -17,7 +17,7 @@ function setCorsHeaders(ctx: Context, origin: string) {
   );
   ctx.response.headers.set(
     "Access-Control-Allow-Headers",
-    MODE === "development" ? "*" : "Content-Type, Traceparent, Tracestate",
+    getMode() === "development" ? "*" : "Content-Type, Traceparent, Tracestate",
   );
   ctx.response.headers.set("Access-Control-Max-Age", "86400");
 }

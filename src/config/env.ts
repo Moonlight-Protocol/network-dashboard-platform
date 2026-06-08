@@ -8,42 +8,108 @@
  * Rule (inherited from council-platform): only INFRASTRUCTURE + OPERATIONAL
  * config goes here. There is no application state — councils/PPs/channels
  * are discovered at runtime from council-platform + Soroban.
+ *
+ * Loading is lazy. The required-vars validation fires the first time a
+ * getter is called, not at module-import. That keeps tests that don't
+ * exercise the env-touching paths (e.g. pure unit tests of event mappers,
+ * state stores, watcher dedup) from having to set env vars they don't use.
+ *
+ * Lookup precedence: process env (`Deno.env.get`) FIRST, `.env` file
+ * SECOND. Process env represents the deployed reality (Fly secrets, CI,
+ * test overrides); `.env` is the local-dev default. The previous order
+ * (file first) silently overrode test/CI overrides on machines with a
+ * populated `.env`.
  */
-import { load } from "@std/dotenv";
+import { loadSync } from "@std/dotenv";
 
-const fileEnv = await load();
-
-function get(key: string): string | undefined {
-  const fromFile = fileEnv[key];
-  if (fromFile !== undefined) return fromFile;
-  return Deno.env.get(key);
+let fileEnvCache: Record<string, string> | null = null;
+function fileEnv(): Record<string, string> {
+  if (fileEnvCache === null) {
+    try {
+      fileEnvCache = loadSync();
+    } catch {
+      fileEnvCache = {};
+    }
+  }
+  return fileEnvCache;
 }
 
-function require(key: string): string {
+function get(key: string): string | undefined {
+  const fromProcess = Deno.env.get(key);
+  if (fromProcess !== undefined && fromProcess !== "") return fromProcess;
+  const fromFile = fileEnv()[key];
+  if (fromFile !== undefined && fromFile !== "") return fromFile;
+  return undefined;
+}
+
+function requireEnv(key: string): string {
   const value = get(key);
-  if (value === undefined || value === "") {
+  if (value === undefined) {
     throw new Error(`${key} is required but was not set`);
   }
   return value;
 }
 
-export const PORT = Number(get("PORT") ?? "8080");
-export const MODE = get("MODE") ?? "development";
-export const NETWORK = require("NETWORK");
-export const STELLAR_RPC_URL = require("STELLAR_RPC_URL");
-export const COUNCIL_PLATFORM_URL = require("COUNCIL_PLATFORM_URL");
-export const LOG_LEVEL = get("LOG_LEVEL") ?? "INFO";
-
-/** Origins allowed to open WS / hit HTTP endpoints. Comma-separated. */
-export const ALLOWED_ORIGINS = (get("ALLOWED_ORIGINS") ?? "")
-  .split(",")
-  .map((o) => o.trim())
-  .filter(Boolean);
-
-if (NETWORK !== "testnet" && NETWORK !== "mainnet" && NETWORK !== "local") {
-  throw new Error(
-    `NETWORK must be 'testnet' | 'mainnet' | 'local' (got: ${NETWORK})`,
-  );
+let networkCache: string | undefined;
+export function getNetwork(): string {
+  if (networkCache !== undefined) return networkCache;
+  const v = requireEnv("NETWORK");
+  if (v !== "testnet" && v !== "mainnet" && v !== "local") {
+    throw new Error(
+      `NETWORK must be 'testnet' | 'mainnet' | 'local' (got: ${v})`,
+    );
+  }
+  networkCache = v;
+  return v;
 }
 
-export const IS_DEV = MODE === "development";
+let stellarRpcUrlCache: string | undefined;
+export function getStellarRpcUrl(): string {
+  if (stellarRpcUrlCache === undefined) {
+    stellarRpcUrlCache = requireEnv("STELLAR_RPC_URL");
+  }
+  return stellarRpcUrlCache;
+}
+
+let councilPlatformUrlCache: string | undefined;
+export function getCouncilPlatformUrl(): string {
+  if (councilPlatformUrlCache === undefined) {
+    councilPlatformUrlCache = requireEnv("COUNCIL_PLATFORM_URL");
+  }
+  return councilPlatformUrlCache;
+}
+
+export function getPort(): number {
+  return Number(get("PORT") ?? "8080");
+}
+
+export function getMode(): string {
+  return get("MODE") ?? "development";
+}
+
+export function getLogLevel(): string {
+  return get("LOG_LEVEL") ?? "INFO";
+}
+
+/** Origins allowed to open WS / hit HTTP endpoints. Comma-separated. */
+export function getAllowedOrigins(): string[] {
+  return (get("ALLOWED_ORIGINS") ?? "")
+    .split(",")
+    .map((o) => o.trim())
+    .filter(Boolean);
+}
+
+export function isDev(): boolean {
+  return getMode() === "development";
+}
+
+/**
+ * Test-only seam. Resets the cached values so a test can change env vars
+ * and observe the new behavior without re-importing the module.
+ */
+export function __resetEnvCacheForTests(): void {
+  fileEnvCache = null;
+  networkCache = undefined;
+  stellarRpcUrlCache = undefined;
+  councilPlatformUrlCache = undefined;
+}

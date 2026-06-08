@@ -1,25 +1,19 @@
 import { assertEquals } from "@std/assert";
+import { publishMappedEvent } from "./soroban-watcher.ts";
+import { networkState } from "@/core/state/store.ts";
+import { NetworkEventBus } from "@/core/events/bus.ts";
+import { newNoop } from "@/utils/logger/index.ts";
+import { __resetEnvCacheForTests } from "@/config/env.ts";
 import type { NetworkEvent } from "@/core/events/types.ts";
 
-// `soroban-watcher.ts` transitively imports `src/config/env.ts`, which
-// `require("NETWORK")`s at module-load time. In CI those env vars are
-// not set (locally they leak in from the shell), so a static `import`
-// throws before any test runs. Static `import` can't be guarded; set the
-// env vars first and dynamically import.
-Deno.env.set("NETWORK", "testnet");
-Deno.env.set(
-  "STELLAR_RPC_URL",
-  "https://soroban-testnet.stellar.org",
-);
-Deno.env.set(
-  "COUNCIL_PLATFORM_URL",
-  "https://council-api-testnet.moonlightprotocol.io",
-);
-
-const { publishMappedEvent } = await import("./soroban-watcher.ts");
-const { networkState } = await import("@/core/state/store.ts");
-const { NetworkEventBus } = await import("@/core/events/bus.ts");
-const { newNoop } = await import("@/utils/logger/index.ts");
+// `COUNCIL_PLATFORM_URL` is consumed lazily by `getCouncilPlatformUrl()`
+// inside `fetchCouncilTopology` (called from `refreshTopology`). The
+// `globalThis.fetch` stub below catches the actual request, so the URL
+// value is never reached. Use the RFC-2606 `.invalid` TLD so that if a
+// future refactor accidentally bypasses the stub the request fails with
+// DNS NXDOMAIN — not a real testnet call.
+Deno.env.set("COUNCIL_PLATFORM_URL", "http://council.test.invalid");
+__resetEnvCacheForTests();
 
 const COUNCIL = "CCVYCJF7ONC4DHYKI34XINUVBBISAMFOD7N4SRRZS2JE2IFBWNUDVMRI";
 const PP = "GAR2WBIXBOXP3GA7XNVOSEIB3QL2OZJRT2QSX24UJFTDVI26M23MEP25";
@@ -45,8 +39,6 @@ Deno.test(
     networkState.__resetForTests();
     const bus = new NetworkEventBus({ log: newNoop() });
 
-    // Stub globalThis.fetch — the only network call refreshTopology makes
-    // is `fetch(${COUNCIL_PLATFORM_URL}/api/v1/public/councils)`.
     const originalFetch = globalThis.fetch;
     const fetchCalls: string[] = [];
     globalThis.fetch = ((input: RequestInfo | URL) => {

@@ -1,5 +1,5 @@
 import type { Logger } from "@/utils/logger/index.ts";
-import { COUNCIL_PLATFORM_URL } from "@/config/env.ts";
+import { getCouncilPlatformUrl } from "@/config/env.ts";
 import type { CouncilTopologyEntry } from "@/core/events/types.ts";
 
 /**
@@ -26,7 +26,7 @@ export async function fetchCouncilTopology(
   const log = deps.log.scope("fetchCouncilTopology");
   log.info("fetchCouncilTopology");
 
-  const base = COUNCIL_PLATFORM_URL.replace(/\/+$/, "");
+  const base = getCouncilPlatformUrl().replace(/\/+$/, "");
   const url = `${base}/api/v1/public/councils`;
   log.debug("url", url);
   const controller = new AbortController();
