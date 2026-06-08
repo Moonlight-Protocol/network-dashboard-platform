@@ -1,6 +1,6 @@
 import { Server } from "stellar-sdk/rpc";
 import type { Logger } from "@/utils/logger/index.ts";
-import { STELLAR_RPC_URL } from "@/config/env.ts";
+import { getStellarRpcUrl } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
 import type { NetworkEventBus } from "@/core/events/bus.ts";
 import { mapChainEvent, type RawChainEvent } from "./event-mapper.ts";
@@ -9,6 +9,7 @@ import {
   drainPendingAdoptions,
   evaluateUnknownContract,
 } from "./contract-init-listener.ts";
+import { refreshTopology } from "./topology-refresh.ts";
 
 const POLL_INTERVAL_MS = 5_000;
 const LOOKBACK_LEDGERS_24H = 17_280; // ~5s ledgers × 24h
@@ -34,8 +35,9 @@ function chunkContractIds(ids: string[]): string[][] {
 let rpcServer: Server | null = null;
 function getServer(): Server {
   if (!rpcServer) {
-    rpcServer = new Server(STELLAR_RPC_URL, {
-      allowHttp: STELLAR_RPC_URL.startsWith("http://"),
+    const url = getStellarRpcUrl();
+    rpcServer = new Server(url, {
+      allowHttp: url.startsWith("http://"),
     });
   }
   return rpcServer;
@@ -58,7 +60,7 @@ function watchedContractIds(): string[] {
   return Array.from(ids);
 }
 
-function publishMappedEvent(
+export function publishMappedEvent(
   event: ReturnType<typeof mapChainEvent>,
   ledgerClosedAtMs: number | null,
   bus: NetworkEventBus,
@@ -85,6 +87,25 @@ function publishMappedEvent(
     if (typeof pp === "string") {
       networkState.registerProvider(pp, event.councilId);
     }
+    // Channels have NO chain event analogue to `provider_added` — the
+    // privacy_channel contract emits nothing on construction and channel
+    // registration is a council-platform-only DB operation
+    // (POST /council/channels). The contract-init listener fires a refresh
+    // on Channel Auth deploy, but channels added AFTER that initial
+    // refresh (the test flow: step 7 add channel → step 9 add_provider
+    // on-chain) leave `channelContractToCouncil` stale. The next deposit's
+    // SAC transfer event lands while `resolveChannelToCouncil(privacyChannel)`
+    // still returns undefined → `channel_deposit` silently dropped.
+    //
+    // `add_provider` on-chain is the deterministic signal that
+    // council-platform definitely has the council's channels persisted by
+    // now (the flow always adds channels before any PP can join). Piggyback
+    // a topology refresh here. `refreshTopology` is single-flight
+    // (topology-refresh.ts:25) so concurrent fires coalesce. Fire-and-forget;
+    // any fetch failure is logged inside.
+    refreshTopology(`provider_added:${event.councilId}`, { log, bus }).catch(
+      (err) => log.error(err, "refreshTopology on provider_added failed"),
+    );
   } else if (event.kind === "provider_removed") {
     const pp = event.payload.providerPublicKey;
     if (typeof pp === "string") {
