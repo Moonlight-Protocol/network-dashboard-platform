@@ -97,22 +97,29 @@ export function mapChainEvent(
 
 /**
  * SAC fee events fire on every bundle execution. We surface them as
- * `channel_bundle` only when the payer is a known PP and the SAC is
- * registered against the same council — that filters out unrelated fee
- * activity (admin/friendbot/etc.).
+ * `channel_bundle` only when the payer is a known PP — that filters out
+ * unrelated fee activity (admin/friendbot/etc.). Attribution is to the
+ * PP's council, not the SAC's.
+ *
+ * We deliberately do NOT look up the council via the SAC contract. Assets
+ * are shared across councils — every council on a given network registers
+ * the same native XLM SAC, and `assetContractToCouncil` is a
+ * `Map<string, string>` whose last-write-wins overwrite silently drops the
+ * `channel_bundle` for every council except whichever one was iterated
+ * last in `replaceTopology`. The PP-side resolver is the precise filter:
+ * if the payer is a registered PP, this fee is from that PP's bundle on
+ * that PP's council, full stop.
  */
 function mapSacFeeEvent(raw: RawChainEvent, now: Date): NetworkEvent | null {
   if (raw.topics.length < 2) return null;
   const payer = decodeAddress(raw.topics[1]);
   if (!payer) return null;
-  const sacCouncilId = networkState.resolveAssetToCouncil(raw.contractId);
-  if (!sacCouncilId) return null;
   const ppCouncilId = networkState.resolveProviderToCouncil(payer);
-  if (ppCouncilId !== sacCouncilId) return null;
+  if (!ppCouncilId) return null;
   return makeEvent(
     "channel_bundle",
-    sacCouncilId,
-    networkState.getCouncilName(sacCouncilId),
+    ppCouncilId,
+    networkState.getCouncilName(ppCouncilId),
     raw,
     now,
     { providerPublicKey: payer, assetContractId: raw.contractId },
