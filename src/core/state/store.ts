@@ -91,16 +91,36 @@ export class NetworkStateStore {
   // ── council topology ───────────────────────────────────────────────
 
   /**
-   * Replace the entire topology atomically (used at cold start + hourly
-   * re-sync). Rebuilds the linkage maps from the supplied entries. Does
-   * NOT touch the event ring buffer or the rolling counter window.
+   * Replace the topology snapshot used for derived linkage. Rebuilds the
+   * council registry + channel/asset linkage maps from the supplied
+   * entries. Does NOT touch the event ring buffer or the rolling counter
+   * window.
+   *
+   * `providerToCouncil` is the one map we intentionally do NOT clear here.
+   * It is also written by `registerProvider` / `unregisterProvider` —
+   * those are the canonical, chain-event-driven writers from
+   * `soroban-watcher.publishMappedEvent`. When the contract-init listener
+   * fires `refreshTopology` (or the provider-added piggyback does), the
+   * fetched topology MAY lag the on-chain state: council-platform's own
+   * EventWatcher runs at a 30 s cadence per Channel Auth contract, so
+   * council-platform's `/public/councils` can return a council whose
+   * providers list still omits a PP that has already fired `provider_added`
+   * on-chain. Clearing this map then re-populating from the fetched
+   * topology silently wiped any `registerProvider` value the watcher had
+   * just set for that PP — the next SAC-fee event from that PP then
+   * dropped `channel_bundle` until council-platform caught up and a later
+   * refresh re-added the entry.
+   *
+   * Instead we union: keep prior writes, set the entries from the
+   * fetched topology. Removal of a PP from `providerToCouncil` is the
+   * responsibility of `unregisterProvider` (driven by `provider_removed`
+   * on chain).
    */
   replaceTopology(entries: CouncilTopologyEntry[]): void {
     this.councils.clear();
     this.assetContractToCouncil.clear();
     this.channelContractToCouncil.clear();
     this.assetCodeByContract.clear();
-    this.providerToCouncil.clear();
     for (const e of entries) {
       this.councils.set(e.id, e);
       for (const c of e.channels) {

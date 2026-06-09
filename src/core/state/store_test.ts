@@ -76,6 +76,63 @@ Deno.test("countActiveProviders sums across councils", () => {
   assertEquals(s.countActiveProviders(), 3);
 });
 
+Deno.test(
+  "replaceTopology does NOT wipe providerToCouncil entries set by registerProvider — eliminates the race where a refresh after registerProvider drops the PP because council-platform hasn't caught up",
+  () => {
+    const s = makeStore();
+    // Initial topology: council CA exists with channel + asset, no
+    // providers yet — exactly the state when a fresh council was just
+    // created on council-platform but its EventWatcher hasn't yet
+    // processed the on-chain provider_added.
+    s.replaceTopology([
+      council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }], []),
+    ]);
+    assertEquals(s.resolveProviderToCouncil("GA"), undefined);
+
+    // Watcher observes provider_added on chain → registerProvider.
+    s.registerProvider("GA", "CA");
+    assertEquals(s.resolveProviderToCouncil("GA"), "CA");
+
+    // refreshTopology fires; council-platform's `/public/councils`
+    // hasn't yet listed GA as ACTIVE for CA. Pre-fix this clobbered
+    // the registerProvider value.
+    s.replaceTopology([
+      council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }], []),
+    ]);
+    assertEquals(
+      s.resolveProviderToCouncil("GA"),
+      "CA",
+      "registerProvider write must survive a subsequent replaceTopology that omits the PP",
+    );
+  },
+);
+
+Deno.test(
+  "replaceTopology overrides providerToCouncil when the fetched topology DOES list the PP (eventual consistency after council-platform catches up)",
+  () => {
+    const s = makeStore();
+    s.registerProvider("GA", "CA");
+    s.replaceTopology([
+      council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }], ["GA"]),
+      council("CB", [{ contractId: "CH2", assetContractId: "SAC2" }], []),
+    ]);
+    assertEquals(s.resolveProviderToCouncil("GA"), "CA");
+  },
+);
+
+Deno.test(
+  "unregisterProvider still removes a PP that was added via replaceTopology",
+  () => {
+    const s = makeStore();
+    s.replaceTopology([
+      council("CA", [], ["GA"]),
+    ]);
+    assertEquals(s.resolveProviderToCouncil("GA"), "CA");
+    s.unregisterProvider("GA");
+    assertEquals(s.resolveProviderToCouncil("GA"), undefined);
+  },
+);
+
 Deno.test("countAssetsRegistered is distinct assetContractIds", () => {
   const s = makeStore();
   s.replaceTopology([
