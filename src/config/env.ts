@@ -83,6 +83,21 @@ export function getPort(): number {
   return Number(get("PORT") ?? "8080");
 }
 
+/**
+ * IP rate-limit for the public Soroban RPC proxy (`POST /api/v1/public/rpc`).
+ * The proxy is an open, JWT-less read relay, so per-IP rate-limiting is the
+ * abuse control. Both are optional with sane defaults — no iac registration
+ * needed; override via Fly env if a deployment needs tighter/looser limits.
+ * Default: 120 requests per 60s per client IP.
+ */
+export function getPublicRpcRateLimit(): number {
+  return Number(get("PUBLIC_RPC_RATE_LIMIT") ?? "120");
+}
+
+export function getPublicRpcRateWindowMs(): number {
+  return Number(get("PUBLIC_RPC_RATE_WINDOW_MS") ?? "60000");
+}
+
 export function getMode(): string {
   return get("MODE") ?? "development";
 }
