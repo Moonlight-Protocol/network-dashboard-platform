@@ -52,6 +52,15 @@ function getServer(): Server {
 let lastLedgerSeen: number | null = null;
 let pollTimer: number | null = null;
 let running = false;
+/**
+ * Consecutive `pollTick`s that found the watcher armed (`running`) but with no
+ * forward cursor (`lastLedgerSeen === null`). This is the "stranded" state:
+ * `bootstrap()` swallows a failed `coldStartScan` and starts the watcher
+ * anyway, so the poll then no-ops silently forever — the dashboard freezes
+ * with a green `/health` and no logs. Tracked so the strand is observable
+ * (loud log + `/health`) instead of invisible. Reset to 0 on any armed tick.
+ */
+let strandedTickCount = 0;
 
 function watchedContractIds(): string[] {
   const ids = new Set<string>();
@@ -360,7 +369,23 @@ export async function coldStartScan(
 async function pollTick(
   deps: { log: Logger; bus: NetworkEventBus },
 ): Promise<void> {
-  if (!running || lastLedgerSeen === null) return;
+  if (!running) return;
+  if (lastLedgerSeen === null) {
+    // Armed but no cursor — cold-start threw (its error is caught + swallowed
+    // in `bootstrap()`) yet the watcher was started. Every tick then no-ops
+    // SILENTLY, freezing the dashboard while `/health` stays green. Make it
+    // loud (rate-limited to ~once/5min at a 5s interval) and observable via
+    // `getWatcherHealth()` so the strand surfaces instead of hiding.
+    strandedTickCount += 1;
+    if (strandedTickCount === 1 || strandedTickCount % 60 === 0) {
+      deps.log.scope("pollTick").error(
+        new Error("forward poller stranded: lastLedgerSeen === null"),
+        "watcher armed but has no cursor — cold-start did not complete; NO events will be ingested until cold-start succeeds (restart/redeploy)",
+      );
+    }
+    return;
+  }
+  strandedTickCount = 0;
   const log = deps.log.scope("pollTick");
 
   const contractIds = watchedContractIds();
@@ -466,6 +491,26 @@ function scheduleNext(deps: { log: Logger; bus: NetworkEventBus }): void {
     await pollTick(deps);
     scheduleNext(deps);
   }, POLL_INTERVAL_MS) as unknown as number;
+}
+
+/**
+ * Liveness snapshot of the forward poller for `/health`.
+ *
+ * `running && !armed` is the stranded state (cold-start failed, watcher
+ * started with a null cursor) — the poller ingests nothing. Surfacing it lets
+ * `/health` report degraded so the strand is caught by monitoring / the Fly
+ * health check instead of silently freezing the dashboard for weeks.
+ */
+export function getWatcherHealth(): {
+  running: boolean;
+  armed: boolean;
+  strandedTickCount: number;
+} {
+  return {
+    running,
+    armed: lastLedgerSeen !== null,
+    strandedTickCount,
+  };
 }
 
 export function startSorobanWatcher(
