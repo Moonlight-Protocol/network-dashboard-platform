@@ -1,6 +1,7 @@
 import type { Logger } from "@/utils/logger/index.ts";
 import { networkState } from "@/core/state/store.ts";
 import type { NetworkEventBus } from "@/core/events/bus.ts";
+import { StructuredError } from "@/error/structured-error.ts";
 import { fetchCouncilTopology } from "./council-fetch.ts";
 
 /**
@@ -53,6 +54,18 @@ async function run(
     log.debug("assets", networkState.countAssetsRegistered());
     log.event("topology refreshed");
   } catch (err) {
-    log.error(err, "topology refresh failed");
+    // Add this layer's context as a NEW outer error (not the idempotent
+    // `from`, which would pass an inner StructuredError through unchanged and
+    // drop the topology-level framing) while keeping the council-fetch error
+    // as the cause so the log shows the full chain. Broadcast the client-safe
+    // frame so connected dashboards can flag that the live view may be stale.
+    const structured = new StructuredError({
+      code: "TOPOLOGY_REFRESH_FAILED",
+      source: "network-dashboard-platform/topology-refresh",
+      message: "Failed to refresh network topology from council-platform",
+      cause: err,
+    });
+    log.error(structured, "topology refresh failed");
+    deps.bus.publishError(structured.toWire());
   }
 }

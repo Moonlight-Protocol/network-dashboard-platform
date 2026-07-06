@@ -89,6 +89,27 @@ function stringify(v: unknown): string {
   }
 }
 
+/**
+ * Flatten a native `Error.cause` chain into a single `A <- B <- C` string so
+ * an error logged at the edge carries the full context of how it bubbled up,
+ * not just the outermost message. Mirrors the error-bubbling standard's
+ * logger on provider-platform. Cycle-guarded and depth-capped.
+ */
+function flattenCauses(err: unknown): string {
+  const parts: string[] = [];
+  const seen = new Set<unknown>();
+  let current: unknown = err;
+  for (let depth = 0; depth < 16 && current != null; depth++) {
+    if (seen.has(current)) break;
+    seen.add(current);
+    parts.push(current instanceof Error ? current.message : String(current));
+    current = current instanceof Error
+      ? (current as { cause?: unknown }).cause
+      : undefined;
+  }
+  return parts.join(" <- ");
+}
+
 function humanFormat(colored: boolean): Format {
   const grayLb = colored ? chalk.gray : (s: string) => s;
   const greenLb = colored ? chalk.green : (s: string) => s;
@@ -174,7 +195,9 @@ class LoggerImpl implements Logger {
 
   error(err: unknown, msg: string): void {
     // ERR always emits regardless of level (matches go-logger / zerolog).
-    const detail = err instanceof Error ? err.message : String(err);
+    // Flatten the native cause chain so a wrapped error logs the full
+    // `outer <- inner <- root` context, not just the outermost message.
+    const detail = flattenCauses(err);
     this.emit({
       ts: now(),
       level: "error",

@@ -88,12 +88,55 @@ const deps = () => ({
   bus: new NetworkEventBus({ log: newNoop() }),
 });
 
-Deno.test("rejects non-upgradable request with 426", () => {
+Deno.test("rejects non-upgradable request with 426 and a structured error body", () => {
   const d = deps();
   const m = mockCtx({ upgradable: false });
   handleNetworkWs(d)(m.ctx as never);
   assertEquals(m.res.status, 426);
   assertEquals(m.upgradeArgs, null);
+  // Body is the client-safe { code, source, message } shape, not a bare string.
+  assertEquals(m.res.body, {
+    error: {
+      code: "WS_UPGRADE_REQUIRED",
+      source: "network-dashboard-platform/network-ws",
+      message: "WebSocket upgrade required",
+    },
+  });
+});
+
+Deno.test("delivers structured error frames published on the bus, and unsubscribes on close", () => {
+  const d = deps();
+  const socket = new MockSocket();
+  const m = mockCtx({ socket });
+
+  handleNetworkWs(d)(m.ctx as never);
+  socket.triggerOpen();
+  // snapshot on open + the error subscription is registered
+  assertEquals(socket.sent.length, 1);
+  assertEquals(d.bus.errorListenerCount(), 1);
+
+  d.bus.publishError({
+    code: "TOPOLOGY_REFRESH_FAILED",
+    source: "network-dashboard-platform/topology-refresh",
+    message: "Failed to refresh network topology from council-platform",
+  });
+  assertEquals(socket.sent.length, 2);
+  const frame = JSON.parse(socket.sent[1]) as {
+    type: string;
+    error: { code: string; source: string; message: string };
+  };
+  assertEquals(frame.type, "error");
+  assertEquals(frame.error.code, "TOPOLOGY_REFRESH_FAILED");
+  assertEquals(
+    frame.error.source,
+    "network-dashboard-platform/topology-refresh",
+  );
+
+  // unsubscribe on close: no delivery afterwards, error listener removed
+  socket.triggerClose();
+  assertEquals(d.bus.errorListenerCount(), 0);
+  d.bus.publishError({ code: "X", source: "y", message: "z" });
+  assertEquals(socket.sent.length, 2);
 });
 
 Deno.test("upgrades with subprotocol + idle-timeout, sends snapshot, delivers live events, drops when not OPEN, unsubscribes on close", () => {

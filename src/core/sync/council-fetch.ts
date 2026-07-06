@@ -1,6 +1,9 @@
 import type { Logger } from "@/utils/logger/index.ts";
 import { getCouncilPlatformUrl } from "@/config/env.ts";
 import type { CouncilTopologyEntry } from "@/core/events/types.ts";
+import { StructuredError } from "@/error/structured-error.ts";
+
+const SOURCE = "network-dashboard-platform/council-fetch";
 
 /**
  * Shape of the upstream `GET /api/v1/public/councils` response. Mirrors
@@ -34,9 +37,24 @@ export async function fetchCouncilTopology(
 
   try {
     log.event("requesting council list");
-    const res = await fetch(url, { signal: controller.signal });
+    let res: Response;
+    try {
+      res = await fetch(url, { signal: controller.signal });
+    } catch (err) {
+      // Network failure / timeout abort — wrap with context, preserving the
+      // underlying cause so the log chain shows the transport error.
+      throw StructuredError.from(err, {
+        code: "COUNCIL_PLATFORM_UNREACHABLE",
+        source: SOURCE,
+        message: "council-platform request failed",
+      });
+    }
     if (!res.ok) {
-      throw new Error(`council-platform returned HTTP ${res.status}`);
+      throw new StructuredError({
+        code: "COUNCIL_PLATFORM_HTTP_ERROR",
+        source: SOURCE,
+        message: `council-platform returned HTTP ${res.status}`,
+      });
     }
     log.event("council list received");
     const body = (await res.json()) as PublicCouncilsResponse;
