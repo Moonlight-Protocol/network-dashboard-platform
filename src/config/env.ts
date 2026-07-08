@@ -21,6 +21,9 @@
  * populated `.env`.
  */
 import { loadSync } from "@std/dotenv";
+import { StructuredError } from "@/error/structured-error.ts";
+
+const SOURCE = "network-dashboard-platform/config/env";
 
 let fileEnvCache: Record<string, string> | null = null;
 function fileEnv(): Record<string, string> {
@@ -45,7 +48,11 @@ function get(key: string): string | undefined {
 function requireEnv(key: string): string {
   const value = get(key);
   if (value === undefined) {
-    throw new Error(`${key} is required but was not set`);
+    throw new StructuredError({
+      code: "ENV_MISSING",
+      source: SOURCE,
+      message: `${key} is required but was not set`,
+    });
   }
   return value;
 }
@@ -55,9 +62,11 @@ export function getNetwork(): string {
   if (networkCache !== undefined) return networkCache;
   const v = requireEnv("NETWORK");
   if (v !== "testnet" && v !== "mainnet" && v !== "local") {
-    throw new Error(
-      `NETWORK must be 'testnet' | 'mainnet' | 'local' (got: ${v})`,
-    );
+    throw new StructuredError({
+      code: "ENV_INVALID_NETWORK",
+      source: SOURCE,
+      message: `NETWORK must be 'testnet' | 'mainnet' | 'local' (got: ${v})`,
+    });
   }
   networkCache = v;
   return v;

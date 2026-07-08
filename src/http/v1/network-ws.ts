@@ -39,6 +39,10 @@ const IDLE_TIMEOUT_SECONDS = 300;
  *     SPA paint.
  *   { type: "event", event: NetworkEvent }
  *     — sent for each live event after the snapshot.
+ *   { type: "error", error: { code, source, message } }
+ *     — sent when the backend hits a structured error worth surfacing (e.g.
+ *     a council-platform topology refresh failed, so the live view may be
+ *     stale). Client-safe shape only — no cause chain / stack.
  *
  * No client → server frames. Clients reconnect rather than keep-alive.
  */
@@ -52,7 +56,13 @@ export function handleNetworkWs(
 
     if (!ctx.isUpgradable) {
       ctx.response.status = 426;
-      ctx.response.body = { error: "WebSocket upgrade required" };
+      ctx.response.body = {
+        error: {
+          code: "WS_UPGRADE_REQUIRED",
+          source: "network-dashboard-platform/network-ws",
+          message: "WebSocket upgrade required",
+        },
+      };
       return;
     }
 
@@ -62,6 +72,7 @@ export function handleNetworkWs(
     });
 
     let unsubscribe: (() => void) | null = null;
+    let unsubscribeErrors: (() => void) | null = null;
     let closed = false;
 
     const cleanup = () => {
@@ -70,6 +81,10 @@ export function handleNetworkWs(
       if (unsubscribe) {
         unsubscribe();
         unsubscribe = null;
+      }
+      if (unsubscribeErrors) {
+        unsubscribeErrors();
+        unsubscribeErrors = null;
       }
     };
 
@@ -91,6 +106,9 @@ export function handleNetworkWs(
           event,
           counters: buildSnapshotFrame().counters,
         });
+      });
+      unsubscribeErrors = deps.bus.subscribeErrors((error) => {
+        sendFrame({ type: "error", error });
       });
       log.debug("subscribers", deps.bus.listenerCount());
       log.event("network WS opened");

@@ -5,6 +5,7 @@
  * The SPA renders each kind with its own activity-card colour and pulse
  * colour. Adding a kind requires SPA changes — keep this union narrow.
  */
+import type { StructuredErrorShape } from "@/error/structured-error.ts";
 
 export const NETWORK_EVENT_KINDS = [
   "council_formed",
@@ -120,7 +121,18 @@ export type LiveFrame = {
   counters: Counters;
 };
 
-export type ServerFrame = SnapshotFrame | LiveFrame;
+/**
+ * Client-safe structured error surfaced to WS subscribers (e.g. a
+ * council-platform topology refresh failed, so the live view may be stale).
+ * Matches the error-bubbling standard's `{ code, source, message }` shape;
+ * carries no internal cause chain or stack. See `@/error/structured-error.ts`.
+ */
+export type ErrorFrame = {
+  type: "error";
+  error: StructuredErrorShape;
+};
+
+export type ServerFrame = SnapshotFrame | LiveFrame | ErrorFrame;
 
 /**
  * Subprotocol echoed back to clients. Bump the suffix on a wire-incompatible
@@ -128,5 +140,10 @@ export type ServerFrame = SnapshotFrame | LiveFrame;
  *
  * v1 → v2: snapshot gained sparklines, asset breakdown, per-council
  * rolling metrics. Counters gained throughputPerMin + latencyMs.
+ *
+ * The additive `error` frame does NOT bump the suffix: it is a new frame
+ * TYPE, not a shape change to an existing frame, so older SPAs simply drop
+ * it via `parseServerFrame` rather than mis-rendering — which keeps a
+ * platform-first deploy from disconnecting not-yet-updated clients.
  */
 export const NETWORK_WS_SUBPROTOCOL = "moonlight.network.v2";
