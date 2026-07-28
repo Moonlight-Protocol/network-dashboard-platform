@@ -1,6 +1,6 @@
 {
   "name": "@moonlight-protocol/network-dashboard-platform",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "license": "MIT",
   "exports": "./src/main.ts",
   "tasks": {
@@ -21,9 +21,9 @@
     "@oak/oak": "jsr:@oak/oak@^17.1.4",
     "@std/assert": "jsr:@std/assert@^1.0.0",
     "@std/dotenv": "jsr:@std/dotenv@^0.225.6",
-    "@stellar/stellar-sdk": "npm:@stellar/stellar-sdk@^15.0.1",
-    "stellar-sdk": "npm:@stellar/stellar-sdk@^15.0.1",
-    "stellar-sdk/rpc": "npm:@stellar/stellar-sdk@^15.0.1/rpc",
+    "@stellar/stellar-sdk": "npm:@stellar/stellar-sdk@^16.1.0",
+    "stellar-sdk": "npm:@stellar/stellar-sdk@^16.1.0",
+    "stellar-sdk/rpc": "npm:@stellar/stellar-sdk@^16.1.0/rpc",
     "chalk": "npm:chalk@^5.3.0"
   }
 }
