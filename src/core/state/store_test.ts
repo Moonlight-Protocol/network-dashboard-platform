@@ -222,6 +222,7 @@ Deno.test("sparklines return 60 buckets, count events in the right bucket", () =
 
 Deno.test("sparklines volume sums deposit + settlement amounts in whole units", () => {
   const s = makeStore();
+  const now = Date.now();
   s.replaceTopology([
     council("CA", [{ contractId: "CH1", assetContractId: "SAC1" }]),
   ]);
@@ -239,7 +240,7 @@ Deno.test("sparklines volume sums deposit + settlement amounts in whole units", 
       amount: "5000000", // 0.5 in whole units
     }, "CA"),
   );
-  const sp = s.sparklines();
+  const sp = s.sparklines(now);
   assertEquals(sp.volume[SPARKLINE_BUCKET_COUNT - 1], 2);
 });
 
