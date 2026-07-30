@@ -83,6 +83,15 @@ export class NetworkStateStore {
   /** Ring buffer of most-recent events for the activity feed. */
   private recent: NetworkEvent[] = [];
   /**
+   * Ids of every event currently tracked (ring buffer + 24h window).
+   * The watcher's cursor-based drains re-read a small overlap by design
+   * (the shared poll position advances to the LOWEST drain point across
+   * calls), so dedup must outlive the 20-entry ring — otherwise a
+   * re-read event past the ring would double-count metrics and re-emit
+   * to WS clients. Pruned by the minute sweep alongside `metrics`.
+   */
+  private seenIds = new Set<string>();
+  /**
    * Sliding 24h metric records (one per event observed within the window).
    * Newest at the end; the cold-start scan seeds in chronological order.
    */
@@ -168,6 +177,10 @@ export class NetworkStateStore {
     return this.providerToCouncil.get(publicKey);
   }
 
+  getProviderPublicKeys(): string[] {
+    return Array.from(this.providerToCouncil.keys());
+  }
+
   /**
    * Surgical, idempotent insert into the providerToCouncil map. Called by
    * the watcher when a `provider_added` chain event is observed, so a PP
@@ -210,9 +223,10 @@ export class NetworkStateStore {
    * close time; pass null when the watcher couldn't determine it.
    */
   recordEvent(event: NetworkEvent, latencyMs: number | null = null): boolean {
-    if (this.recent.some((e) => e.id === event.id)) {
+    if (this.seenIds.has(event.id)) {
       return false;
     }
+    this.seenIds.add(event.id);
     this.recent.unshift(event);
     if (this.recent.length > RING_BUFFER_SIZE) {
       this.recent.length = RING_BUFFER_SIZE;
@@ -234,12 +248,24 @@ export class NetworkStateStore {
     return true;
   }
 
-  /** Drop metric records older than 24h. Called by the minute-sweep. */
+  /**
+   * Drop metric records older than 24h. Called by the minute-sweep.
+   * `seenIds` is rebuilt from the survivors (+ the ring buffer) so the
+   * dedup set stays bounded; a pruned id cannot legitimately reappear —
+   * the watcher's poll position only moves forward.
+   */
   sweepWindow(now: number = Date.now()): number {
     const cutoff = now - ROLLING_WINDOW_MS;
     const before = this.metrics.length;
     this.metrics = this.metrics.filter((m) => m.occurredAt >= cutoff);
-    return before - this.metrics.length;
+    const purged = before - this.metrics.length;
+    if (purged > 0) {
+      this.seenIds = new Set([
+        ...this.metrics.map((m) => m.id),
+        ...this.recent.map((e) => e.id),
+      ]);
+    }
+    return purged;
   }
 
   /**
@@ -259,6 +285,7 @@ export class NetworkStateStore {
       if (existing.has(e.id)) continue;
       const ts = Date.parse(e.occurredAt);
       if (Number.isNaN(ts)) continue;
+      this.seenIds.add(e.id);
       const { assetContractId, amountStroops } = readPayload(e);
       this.metrics.push({
         id: e.id,
@@ -275,6 +302,7 @@ export class NetworkStateStore {
   /** Seed the ring buffer at cold start (newest entries first). */
   seedRecent(events: NetworkEvent[]): void {
     this.recent = events.slice(0, RING_BUFFER_SIZE);
+    for (const e of this.recent) this.seenIds.add(e.id);
   }
 
   recentEvents(): NetworkEvent[] {
@@ -467,6 +495,7 @@ export class NetworkStateStore {
     this.providerToCouncil.clear();
     this.recent = [];
     this.metrics = [];
+    this.seenIds.clear();
   }
 }
 

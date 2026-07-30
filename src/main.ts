@@ -23,9 +23,10 @@ import { startScheduler, stopScheduler } from "@/core/sync/scheduler.ts";
  *   3. Start the forward poller (Soroban watcher). It also polls
  *      Soroban-wide for `contract_initialized` events from unknown
  *      contracts and feeds them to the contract-init-listener, which
- *      triggers an immediate topology refresh on each unknown — this
- *      replaces the hourly periodic re-sync.
- *   4. Start the scheduler (minute window sweep only).
+ *      triggers a topology refresh + adoption back-fill per unknown.
+ *   4. Start the scheduler (minute window sweep + periodic topology
+ *      re-sync — the backstop for DB-only registrations like channels
+ *      and jurisdictions, which emit no chain event).
  *   5. Start the HTTP server.
  *
  * Steps 1-2 are best-effort: a failure logs + continues so the service
