@@ -190,6 +190,152 @@ Deno.test(
   },
 );
 
+// ── SAC transfer amount decoding ─────────────────────────────────────
+//
+// Vectors below are real testnet XLM-SAC events (contract
+// CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC), captured via
+// getEvents on 2026-07-31. The `value` fields are the verbatim on-chain
+// ScVal XDR.
+
+/** Council Felix channel, deposit target of the real event below. */
+const FELIX_CHANNEL =
+  "CD5MZC6UZMCMWBRXPLCS64KGRSR3JNS7AMNMXKSH54U67ES2A5EYKPF2";
+const FELIX_COUNCIL =
+  "CA7PXPUF6F7IQS7WNKVSFXMGN3K4RH7CCRZAGW7YDMEEN6NAPCF6HGCB";
+const DEPOSITOR = "GDKSTZ3625774QCMTEK3OEE22I56AJNQP7WFW7TQ62SR5PUMGSL4OBEF";
+const SETTLE_TARGET =
+  "GBCDULBXJ4W4Y2YT63ZWPJTKSMXDEAXW65FSALO5LGXUE2YWCEUFQXU7";
+
+/** Event 0016589233871425536-0000000000, ledger 3862482: 1000500000 stroops. */
+const DEPOSIT_VALUE_XDR = "AAAACgAAAAAAAAAAAAAAADuiayA=";
+/** Event 0016589324065746944-0000000000, ledger 3862503: 200000000 stroops. */
+const SETTLEMENT_VALUE_XDR = "AAAACgAAAAAAAAAAAAAAAAvrwgA=";
+/**
+ * Event 0016589229576450048-0000000000, ledger 3862481: CAP-67 muxed
+ * shape — scvMap {"amount": i128(1), "to_muxed_id": bytes}. Pre-fix,
+ * decodeI128 rejected this shape and the amount mapped to null.
+ */
+const MUXED_VALUE_XDR =
+  "AAAAEQAAAAEAAAACAAAADwAAAAZhbW91bnQAAAAAAAoAAAAAAAAAAAAAAAAAAAABAAAADwAAAAt0b19tdXhlZF9pZAAAAAANAAAAIKrVu6zZFi/PWS6FlvvvFihDN7XI1REOcBA7gVy4JubM";
+
+function sacTransferEvent(
+  from: string,
+  to: string,
+  valueXdr: string,
+  ledgerClosedAtMs: number | null = 1_700_000_000_000,
+): RawChainEvent {
+  return {
+    id: "0016589233871425536-0000000000",
+    contractId: SAC,
+    ledger: 3862482,
+    topics: [
+      xdr.ScVal.scvSymbol("transfer"),
+      Address.fromString(from).toScVal(),
+      Address.fromString(to).toScVal(),
+      xdr.ScVal.scvString("native"),
+    ],
+    value: xdr.ScVal.fromXDR(valueXdr, "base64"),
+    txHash: "tx-transfer-1",
+    ledgerClosedAtMs,
+  };
+}
+
+function felixTopology() {
+  networkState.__resetForTests();
+  networkState.replaceTopology([
+    {
+      id: FELIX_COUNCIL,
+      name: "Council Felix",
+      providers: [],
+      channels: [{
+        contractId: FELIX_CHANNEL,
+        assetCode: "XLM",
+        assetContractId: SAC,
+      }],
+      jurisdictions: [],
+    },
+  ]);
+}
+
+Deno.test(
+  "mapSacTransferEvent decodes the amount of a real on-chain deposit (plain i128 value)",
+  () => {
+    felixTopology();
+    const mapped = mapChainEvent(
+      sacTransferEvent(DEPOSITOR, FELIX_CHANNEL, DEPOSIT_VALUE_XDR),
+    );
+    assertEquals(mapped?.kind, "channel_deposit");
+    assertEquals(mapped?.councilId, FELIX_COUNCIL);
+    assertEquals(mapped?.payload.amount, "1000500000");
+    assertEquals(mapped?.payload.assetContractId, SAC);
+  },
+);
+
+Deno.test(
+  "mapSacTransferEvent decodes the amount of a real on-chain settlement (plain i128 value)",
+  () => {
+    felixTopology();
+    const mapped = mapChainEvent(
+      sacTransferEvent(FELIX_CHANNEL, SETTLE_TARGET, SETTLEMENT_VALUE_XDR),
+    );
+    assertEquals(mapped?.kind, "channel_settlement");
+    assertEquals(mapped?.payload.amount, "200000000");
+  },
+);
+
+Deno.test(
+  "mapSacTransferEvent decodes the CAP-67 muxed map value shape (amount + to_muxed_id)",
+  () => {
+    felixTopology();
+    const mapped = mapChainEvent(
+      sacTransferEvent(DEPOSITOR, FELIX_CHANNEL, MUXED_VALUE_XDR),
+    );
+    assertEquals(mapped?.kind, "channel_deposit");
+    assertEquals(mapped?.payload.amount, "1");
+  },
+);
+
+Deno.test(
+  "mapSacTransferEvent reassembles i128 amounts above 2^64 into a plain decimal string",
+  () => {
+    felixTopology();
+    // hi=1, lo=1 → 2^64 + 1. Pre-fix this decoded to the unparseable "1:1".
+    const big = xdr.ScVal.scvI128(
+      new xdr.Int128Parts({
+        hi: new xdr.Int64(1n),
+        lo: new xdr.Uint64(1n),
+      }),
+    );
+    const raw = sacTransferEvent(DEPOSITOR, FELIX_CHANNEL, DEPOSIT_VALUE_XDR);
+    raw.value = big;
+    const mapped = mapChainEvent(raw);
+    assertEquals(mapped?.payload.amount, "18446744073709551617");
+  },
+);
+
+Deno.test(
+  "a real deposit event flows through the store into sparkline volume and the 24h asset breakdown",
+  () => {
+    felixTopology();
+    const closedAtMs = 1_700_000_000_000;
+    const mapped = mapChainEvent(
+      sacTransferEvent(DEPOSITOR, FELIX_CHANNEL, DEPOSIT_VALUE_XDR, closedAtMs),
+    );
+    if (!mapped) throw new Error("expected mapped deposit event");
+    assertEquals(networkState.recordEvent(mapped, 1200), true);
+
+    const sp = networkState.sparklines(closedAtMs);
+    // 1000500000 stroops = 100.05 XLM, landing in the newest bucket.
+    assertEquals(sp.volume[sp.volume.length - 1], 100.05);
+
+    const breakdown = networkState.assetBreakdown24h(closedAtMs);
+    assertEquals(breakdown.length, 1);
+    assertEquals(breakdown[0].assetContractId, SAC);
+    assertEquals(breakdown[0].amountStroops, "1000500000");
+    assertEquals(breakdown[0].percent, 100);
+  },
+);
+
 Deno.test(
   "registerProvider is idempotent — a later replaceTopology overwriting the same value is safe",
   () => {
