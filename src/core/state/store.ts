@@ -41,12 +41,10 @@ type MetricEvent = {
 };
 
 /**
- * Parse a decoded amount string back to bigint stroops.
- * `decodeI128` returns either a plain decimal string (when the high
- * 64 bits are zero — the common case for normal asset amounts) or
- * `<hi>:<lo>` for true 128-bit values. Only the plain form is sortable
- * arithmetic; the colon form is dropped from metric aggregates but kept
- * in the wire payload for display.
+ * Parse a decoded amount string back to bigint stroops. The event mapper
+ * emits a plain (possibly signed) decimal string for the full i128 range;
+ * anything else is dropped from metric aggregates but kept in the wire
+ * payload for display.
  */
 function parseAmount(raw: unknown): bigint | null {
   if (typeof raw !== "string" || raw.length === 0) return null;

@@ -60,12 +60,35 @@ function decodeAddress(val: xdr.ScVal): string | null {
 function decodeI128(val: xdr.ScVal): string | null {
   if (val.switch().name !== "scvI128") return null;
   const parts = val.i128();
-  const hi = parts.hi().toString();
-  const lo = parts.lo().toString();
-  // Best-effort string representation; full i128 math isn't needed for
-  // a display-layer ticker.
-  if (hi === "0") return lo;
-  return `${hi}:${lo}`;
+  // Signed reassembly: hi is the signed high 64 bits, lo the unsigned
+  // low 64 bits, so the value is hi * 2^64 + lo. The store's parseAmount
+  // requires a plain decimal string to include the amount in volume and
+  // asset-breakdown aggregates.
+  const hi = BigInt(parts.hi().toString());
+  const lo = BigInt(parts.lo().toString());
+  return ((hi << 64n) + lo).toString();
+}
+
+/**
+ * Amount carried by a SAC `transfer` event's data. Two shapes exist
+ * on-chain since protocol 23 (CAP-67 unified asset events): a bare i128
+ * amount, or a map {"amount": i128, "to_muxed_id": ...} when the
+ * destination carries a muxed id. Both occur on live testnet ledgers, so
+ * a transfer into a channel from a muxed source must not lose its amount.
+ */
+function decodeTransferAmount(val: xdr.ScVal): string | null {
+  if (val.switch().name === "scvI128") return decodeI128(val);
+  if (val.switch().name === "scvMap") {
+    for (const entry of val.map() ?? []) {
+      const key = entry.key();
+      if (
+        key.switch().name === "scvSymbol" && key.sym().toString() === "amount"
+      ) {
+        return decodeI128(entry.val());
+      }
+    }
+  }
+  return null;
 }
 
 /**
@@ -166,7 +189,7 @@ function mapSacTransferEvent(
   const to = decodeAddress(raw.topics[2]);
   if (!from || !to) return null;
 
-  const amount = decodeI128(raw.value);
+  const amount = decodeTransferAmount(raw.value);
 
   // Deposit: transfer TO a known channel address.
   const depositCouncilId = networkState.resolveChannelToCouncil(to);
