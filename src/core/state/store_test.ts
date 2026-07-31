@@ -305,3 +305,36 @@ Deno.test("councilRollingMetrics returns zero rows for known but quiet councils"
   assertEquals(rolling["CB"].bundlesLastHour, 0);
   assertEquals(rolling["CB"].eventsLastHour, 0);
 });
+
+Deno.test("recordEvent dedups by id past the ring buffer (cursor re-reads)", () => {
+  const s = makeStore();
+  // Overflow the 20-entry ring so the first event is long gone from it.
+  for (let i = 0; i < RING_BUFFER_CAPACITY + 5; i++) {
+    assertEquals(s.recordEvent(event(`e${i}`)), true);
+  }
+  // The watcher's shared-cursor advance re-reads overlap by design; a
+  // re-observed event must stay a no-op even when it left the ring.
+  assertEquals(s.recordEvent(event("e0")), false);
+  assertEquals(s.countEventsLast24h(), RING_BUFFER_CAPACITY + 5);
+});
+
+Deno.test("sweepWindow prunes the dedup set with the metrics", () => {
+  const s = makeStore();
+  s.recordEvent(event("old", "provider_added", ROLLING_WINDOW_DURATION_MS * 2));
+  s.recordEvent(event("fresh"));
+  // "old" is beyond 24h: swept from metrics. It is still in the ring
+  // buffer, so it must survive in the dedup set via the ring rebuild.
+  assertEquals(s.sweepWindow(), 1);
+  assertEquals(s.recordEvent(event("old")), false);
+  assertEquals(s.recordEvent(event("fresh")), false);
+  assertEquals(s.countEventsLast24h(), 1);
+});
+
+Deno.test("getProviderPublicKeys reflects topology + chain-event writes", () => {
+  const s = makeStore();
+  s.replaceTopology([council("CA", [], ["GA", "GB"])]);
+  s.registerProvider("GC", "CA");
+  assertEquals(s.getProviderPublicKeys().sort(), ["GA", "GB", "GC"]);
+  s.unregisterProvider("GB");
+  assertEquals(s.getProviderPublicKeys().sort(), ["GA", "GC"]);
+});

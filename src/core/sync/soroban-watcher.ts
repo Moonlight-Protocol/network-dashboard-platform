@@ -1,4 +1,6 @@
 import { Server } from "stellar-sdk/rpc";
+import type { Api } from "stellar-sdk/rpc";
+import { Address, xdr } from "stellar-sdk";
 import type { Logger } from "@/utils/logger/index.ts";
 import { getStellarRpcUrl } from "@/config/env.ts";
 import { networkState } from "@/core/state/store.ts";
@@ -14,19 +16,42 @@ import { refreshTopology } from "./topology-refresh.ts";
 const POLL_INTERVAL_MS = 5_000;
 const LOOKBACK_LEDGERS_24H = 17_280; // ~5s ledgers × 24h
 const PAGE_LIMIT = 100;
+/** Soroban RPC caps `contractIds` per filter (5 in stellar-soroban-rpc). */
+const MAX_CONTRACT_IDS_PER_FILTER = 5;
+/** Soroban RPC caps topic patterns per filter (5). */
+const MAX_TOPIC_PATTERNS_PER_FILTER = 5;
 /**
- * Soroban RPC caps `contractIds` per filter (5 in stellar-soroban-rpc as
- * of writing). We split the watched-contracts set into chunks of this size
- * and issue one getEvents call per chunk — both for the forward poll and
- * the cold-start scan.
+ * Ledger span per windowed getEvents request. RPC providers bound the
+ * work a single request may do — Quasar returns `-32001 request exceeded
+ * processing limit threshold` on wide scans, and the cost multiplies per
+ * FILTER in the call (a combined councils+SAC call failed at a 2 000
+ * window where each filter alone handles 4 000+; measured on mainnet).
+ * Hence one filter per call, `endLedger`-bounded windows, and halving on
+ * a processing-limit rejection down to MIN_SCAN_WINDOW_LEDGERS.
  */
-const CONTRACT_IDS_PER_FILTER = 5;
+const INITIAL_SCAN_WINDOW_LEDGERS = 4_000;
+const MIN_SCAN_WINDOW_LEDGERS = 250;
+/**
+ * Per-call request budget for one forward-poll tick. A tick normally
+ * resumes at the head cursor and drains in a single request; the budget
+ * only matters when catching up after degradation (windowed walk: ~5
+ * requests per 24h of gap). On exhaustion the drain stops at a safe
+ * cursor and the next tick resumes from it — nothing is skipped.
+ */
+const FORWARD_REQUEST_CAP = 20;
+/**
+ * Per-call request budget for the cold-start / back-fill walks. This is
+ * a runaway guard, not a coverage bound: a sparse 24h walk costs ~5
+ * windowed requests, so 200 covers pathological density and window
+ * halving. When it fires we log loudly — anything past the cap is left
+ * for the forward poll to pick up from the returned cursor.
+ */
+const SCAN_REQUEST_CAP = 200;
 
-function chunkContractIds(ids: string[]): string[][] {
-  if (ids.length === 0) return [];
-  const out: string[][] = [];
-  for (let i = 0; i < ids.length; i += CONTRACT_IDS_PER_FILTER) {
-    out.push(ids.slice(i, i + CONTRACT_IDS_PER_FILTER));
+function chunk<T>(items: T[], size: number): T[][] {
+  const out: T[][] = [];
+  for (let i = 0; i < items.length; i += size) {
+    out.push(items.slice(i, i + size));
   }
   return out;
 }
@@ -44,29 +69,283 @@ function getServer(): Server {
 }
 
 /**
- * Cursor tracking. We forward-poll a union of (Channel Auth contracts) +
- * (SAC contracts) — the SAC set may grow as the topology gains new
- * channels, so we recompute the contractIds filter from networkState on
- * every tick.
+ * Forward-poll position. `lastCursor` is the RPC event cursor everything
+ * up to which has been consumed — the resume point for the next tick.
+ * `lastLedgerSeen` tracks the RPC head for /health (`armed`) and as the
+ * startLedger fallback when no cursor exists yet (fresh boot with a
+ * failed cold-start scan).
  */
+let lastCursor: string | null = null;
 let lastLedgerSeen: number | null = null;
 let pollTimer: number | null = null;
 let running = false;
 /**
  * Consecutive `pollTick`s that found the watcher armed (`running`) but with no
- * forward cursor (`lastLedgerSeen === null`). This is the "stranded" state:
- * `bootstrap()` swallows a failed `coldStartScan` and starts the watcher
- * anyway, so the poll then no-ops silently forever — the dashboard freezes
- * with a green `/health` and no logs. Tracked so the strand is observable
- * (loud log + `/health`) instead of invisible. Reset to 0 on any armed tick.
+ * forward position (`lastCursor` and `lastLedgerSeen` both null). This is the
+ * "stranded" state: `bootstrap()` swallows a failed `coldStartScan` and starts
+ * the watcher anyway, so the poll then no-ops silently forever — the dashboard
+ * freezes with a green `/health` and no logs. Tracked so the strand is
+ * observable (loud log + `/health`) instead of invisible. Reset to 0 on any
+ * armed tick.
  */
 let strandedTickCount = 0;
 
-function watchedContractIds(): string[] {
-  const ids = new Set<string>();
-  for (const c of networkState.getCouncilIds()) ids.add(c);
-  for (const a of networkState.getAssetContractIds()) ids.add(a);
-  return Array.from(ids);
+// ── event query specs ─────────────────────────────────────────────────
+
+const TRANSFER_TOPIC = xdr.ScVal.scvSymbol("transfer").toXDR("base64");
+const FEE_TOPIC = xdr.ScVal.scvSymbol("fee").toXDR("base64");
+
+/** Address → base64 ScVal XDR, cached (topology entries repeat every tick). */
+const addressTopicCache = new Map<string, string>();
+function addressTopic(address: string): string {
+  let encoded = addressTopicCache.get(address);
+  if (!encoded) {
+    encoded = new Address(address).toScVal().toXDR("base64");
+    addressTopicCache.set(address, encoded);
+  }
+  return encoded;
+}
+
+export type WatchQueryCall = {
+  label: string;
+  filter: Api.EventFilter;
+};
+
+/**
+ * Build the getEvents subscriptions for the current topology — ONE filter
+ * per call, because the RPC's per-request processing limit multiplies with
+ * each filter in a call (see INITIAL_SCAN_WINDOW_LEDGERS).
+ *
+ * Channel Auth (council) contracts are low-volume, so they get plain
+ * contractIds filters. SAC contracts are NOT watched raw: the mainnet
+ * XLM SAC emits hundreds of `transfer`/`fee` events per LEDGER, which
+ * drowned any unfiltered subscription (a 100-event page didn't even span
+ * one ledger). Instead we subscribe by topic:
+ *
+ *   - deposit:    ["transfer", *, <channel address>, *]
+ *   - settlement: ["transfer", <channel address>, *, *]
+ *   - bundle fee: ["fee", <PP public key>]
+ *
+ * Topic filters are exact-length positional (SAC `transfer` carries 4
+ * topics, `fee` carries 2 — verified against mainnet), so each pattern
+ * matches only its event shape. Within a filter the patterns are OR'd;
+ * RPC caps (5 contractIds / 5 patterns per filter) drive the chunking.
+ */
+export function buildWatchQueryCalls(): WatchQueryCall[] {
+  const councilIds = [...networkState.getCouncilIds()].sort();
+  const channelIds = [...networkState.getChannelContractIds()].sort();
+  const sacIds = [...networkState.getAssetContractIds()].sort();
+  const providerKeys = [...networkState.getProviderPublicKeys()].sort();
+
+  const filters: Api.EventFilter[] = [];
+  for (const ids of chunk(councilIds, MAX_CONTRACT_IDS_PER_FILTER)) {
+    filters.push({ type: "contract", contractIds: ids });
+  }
+
+  const patterns: string[][] = [];
+  for (const channel of channelIds) {
+    patterns.push([TRANSFER_TOPIC, "*", addressTopic(channel), "*"]);
+    patterns.push([TRANSFER_TOPIC, addressTopic(channel), "*", "*"]);
+  }
+  for (const pp of providerKeys) {
+    patterns.push([FEE_TOPIC, addressTopic(pp)]);
+  }
+  if (sacIds.length > 0 && patterns.length > 0) {
+    for (const sacs of chunk(sacIds, MAX_CONTRACT_IDS_PER_FILTER)) {
+      for (const pats of chunk(patterns, MAX_TOPIC_PATTERNS_PER_FILTER)) {
+        filters.push({ type: "contract", contractIds: sacs, topics: pats });
+      }
+    }
+  }
+
+  return filters.map((filter, i) => ({ label: `watch:${i}`, filter }));
+}
+
+// ── cursor-paged drain ────────────────────────────────────────────────
+
+export type DrainOutcome = {
+  raws: RawChainEvent[];
+  /**
+   * RPC cursor after the last consumed page. Everything at or before it
+   * has been returned in `raws`, so advancing the poll position to it
+   * never skips an event. Null when not even the first page succeeded.
+   */
+  cursor: string | null;
+  latestLedger: number | null;
+  /** True when the drain reached the RPC head (a partial page). */
+  complete: boolean;
+};
+
+function toRawChainEvent(ev: Api.EventResponse): RawChainEvent {
+  return {
+    id: ev.id,
+    contractId: ev.contractId?.toString() ?? "",
+    ledger: ev.ledger,
+    topics: ev.topic,
+    value: ev.value,
+    txHash: ev.txHash ?? "",
+    ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
+  };
+}
+
+/** Ledger encoded in an RPC event cursor (`<toid>-<eventIndex>`). */
+export function ledgerOfCursor(cursor: string): number {
+  return Number(BigInt(cursor.split("-")[0]) >> 32n);
+}
+
+/**
+ * Message of a getEvents failure. The SDK's JSON-RPC layer throws the raw
+ * `{code, message}` error object (not an Error), which stringifies to
+ * `[object Object]` — extract the message so error classification and
+ * logs stay useful.
+ */
+function errMessage(err: unknown): string {
+  if (err instanceof Error) return err.message;
+  if (typeof err === "object" && err !== null && "message" in err) {
+    return String((err as { message: unknown }).message);
+  }
+  return String(err);
+}
+
+/** Quasar rejects over-wide scans with `-32001 ... processing limit`. */
+function isProcessingLimit(err: unknown): boolean {
+  return /processing limit/i.test(errMessage(err));
+}
+
+/**
+ * Page through getEvents from `base` until the RPC head or the request
+ * budget. Two RPC behaviours shape the loop (both measured on mainnet
+ * Quasar):
+ *
+ *   - A response may cover only a SLICE of the requested range (bounded
+ *     scan work), returning a partial/empty page whose cursor sits well
+ *     below `latestLedger`. "Partial page" therefore does NOT mean
+ *     "caught up" — head is reached only when the cursor's ledger
+ *     reaches `latestLedger`.
+ *   - An over-wide request fails outright with a processing-limit error
+ *     instead of slicing. Sparse stretches are walked with
+ *     `endLedger`-bounded windows (halved on rejection); a full page
+ *     switches to cursor continuation, which resumes mid-ledger and
+ *     stops cheaply at the page limit.
+ *
+ * Consumption is gap-free: every position advance is either the RPC's own
+ * scan cursor or `scannedTo + 1`. A processing-limit rejection of a
+ * cursor request falls back to a window starting at the cursor's ledger
+ * (re-reading that ledger's tail; dedup by event id absorbs it).
+ */
+export async function drainEvents(
+  base: { startLedger: number } | { cursor: string },
+  filters: Api.EventFilter[],
+  requestCap: number,
+  log: Logger,
+): Promise<DrainOutcome> {
+  const server = getServer();
+  const out: DrainOutcome = {
+    raws: [],
+    cursor: null,
+    latestLedger: null,
+    complete: false,
+  };
+  let position: { startLedger: number } | { cursor: string } = base;
+  let window = INITIAL_SCAN_WINDOW_LEDGERS;
+  let retriedAtFloor = false;
+
+  for (let requests = 0; requests < requestCap; requests++) {
+    const request: Api.GetEventsRequest = "cursor" in position
+      ? { cursor: position.cursor, filters, limit: PAGE_LIMIT }
+      : {
+        startLedger: position.startLedger,
+        endLedger: position.startLedger + window - 1,
+        filters,
+        limit: PAGE_LIMIT,
+      };
+    let res: Api.GetEventsResponse;
+    try {
+      res = await server.getEvents(request);
+    } catch (err) {
+      if (isProcessingLimit(err)) {
+        if ("cursor" in position) {
+          // Cursor scans carry no endLedger bound; re-anchor to a window.
+          position = { startLedger: ledgerOfCursor(position.cursor) };
+          continue;
+        }
+        if (window > MIN_SCAN_WINDOW_LEDGERS) {
+          window = Math.max(MIN_SCAN_WINDOW_LEDGERS, Math.floor(window / 2));
+          log.debug("window", window);
+          log.event("processing-limit rejection; halving scan window");
+          continue;
+        }
+      }
+      if (!retriedAtFloor && "startLedger" in position) {
+        const floor = parseValidRangeFloor(err);
+        if (floor !== null && floor > position.startLedger) {
+          retriedAtFloor = true;
+          log.debug("requestedStartLedger", position.startLedger);
+          log.debug("retentionFloor", floor);
+          log.event("startLedger below retention; retrying at floor");
+          position = { startLedger: floor };
+          continue;
+        }
+      }
+      log.debug("requests", requests);
+      log.error(
+        new Error(errMessage(err)),
+        "getEvents failed (drain incomplete)",
+      );
+      return out;
+    }
+
+    out.cursor = res.cursor;
+    out.latestLedger = res.latestLedger;
+    for (const ev of res.events) {
+      out.raws.push(toRawChainEvent(ev));
+    }
+
+    if (res.events.length === PAGE_LIMIT) {
+      // Dense stretch — continue mid-ledger from the exact cursor.
+      position = { cursor: res.cursor };
+      continue;
+    }
+    const scannedTo = ledgerOfCursor(res.cursor);
+    if (scannedTo >= res.latestLedger) {
+      out.complete = true;
+      return out;
+    }
+    // Partial/empty page below head: the RPC bounded its scan (or our
+    // window ended) — step the window forward from where scanning stopped.
+    position = { startLedger: scannedTo + 1 };
+  }
+
+  log.debug("requestCap", requestCap);
+  log.debug("eventsDrained", out.raws.length);
+  log.event(
+    "drain hit request cap before reaching head; resuming from cursor next pass",
+  );
+  return out;
+}
+
+/**
+ * Numeric compare of RPC event cursors (`<toid>-<eventIndex>`). Used to
+ * advance the shared poll position to the LOWEST drain point across the
+ * tick's calls — never past a call that consumed less. The overlap this
+ * re-reads on the faster calls is deduped by event id in the store.
+ */
+export function minCursor(cursors: string[]): string | null {
+  let min: string | null = null;
+  let minParts: [bigint, bigint] | null = null;
+  for (const c of cursors) {
+    const [a, b] = c.split("-");
+    const parts: [bigint, bigint] = [BigInt(a), BigInt(b ?? "0")];
+    if (
+      minParts === null ||
+      parts[0] < minParts[0] ||
+      (parts[0] === minParts[0] && parts[1] < minParts[1])
+    ) {
+      min = c;
+      minParts = parts;
+    }
+  }
+  return min;
 }
 
 export function publishMappedEvent(
@@ -99,19 +378,13 @@ export function publishMappedEvent(
     // Channels have NO chain event analogue to `provider_added` — the
     // privacy_channel contract emits nothing on construction and channel
     // registration is a council-platform-only DB operation
-    // (POST /council/channels). The contract-init listener fires a refresh
-    // on Channel Auth deploy, but channels added AFTER that initial
-    // refresh (the test flow: step 7 add channel → step 9 add_provider
-    // on-chain) leave `channelContractToCouncil` stale. The next deposit's
-    // SAC transfer event lands while `resolveChannelToCouncil(privacyChannel)`
-    // still returns undefined → `channel_deposit` silently dropped.
-    //
-    // `add_provider` on-chain is the deterministic signal that
-    // council-platform definitely has the council's channels persisted by
-    // now (the flow always adds channels before any PP can join). Piggyback
-    // a topology refresh here. `refreshTopology` is single-flight
-    // (topology-refresh.ts:25) so concurrent fires coalesce. Fire-and-forget;
-    // any fetch failure is logged inside.
+    // (POST /council/channels). `add_provider` on-chain is a deterministic
+    // signal that council-platform has the council's channels persisted by
+    // now (the flow always adds channels before any PP can join), so
+    // piggyback a topology refresh here for a fast channel-linkage update;
+    // the periodic re-sync (scheduler) is the completeness backstop.
+    // `refreshTopology` is single-flight (topology-refresh.ts) so
+    // concurrent fires coalesce. Fire-and-forget; failures log inside.
     refreshTopology(`provider_added:${event.councilId}`, { log, bus }).catch(
       (err) => log.error(err, "refreshTopology on provider_added failed"),
     );
@@ -200,15 +473,15 @@ function parseLedgerClosedAt(raw: unknown): number | null {
  * null if the error doesn't match that pattern.
  */
 function parseValidRangeFloor(err: unknown): number | null {
-  const msg = err instanceof Error ? err.message : String(err);
-  const match = msg.match(/ledger range:\s*(\d+)\s*-\s*\d+/);
+  const match = errMessage(err).match(/ledger range:\s*(\d+)\s*-\s*\d+/);
   return match ? Number(match[1]) : null;
 }
 
 /**
- * Cold-start scan: walk trailing 24h on the current contractId set,
+ * Cold-start scan: walk trailing 24h on the current subscription set,
  * map events, and seed the rolling window + ring buffer in chronological
- * order. Sets the forward cursor to one past the latest ledger seen.
+ * order. Arms the forward poller with the drain cursor (or, degraded,
+ * the head ledger).
  */
 export async function coldStartScan(
   deps: { log: Logger; bus: NetworkEventBus },
@@ -220,10 +493,12 @@ export async function coldStartScan(
   const latest = await server.getLatestLedger();
   // Soroban's *event* retention is much shorter than its ledger retention
   // (getHealth.oldestLedger). Querying below the events floor returns
-  // 0 events without erroring, so probe with progressively smaller
-  // lookbacks until events appear. Long-retention providers (testnet /
-  // mainnet) typically return events on the first try; the quickstart
-  // container needs a closer startLedger.
+  // 0 events without erroring on some providers, so probe with
+  // progressively smaller lookbacks until events appear. Long-retention
+  // providers (testnet / mainnet) typically return events on the first
+  // try; the quickstart container needs a closer startLedger. (Providers
+  // that ERROR below the floor instead are handled by the drain's
+  // retry-at-floor.)
   const desiredStart = Math.max(
     1,
     latest.sequence - LOOKBACK_LEDGERS_24H,
@@ -253,10 +528,12 @@ export async function coldStartScan(
       log.error(err, "cold-start probe failed at lookback");
     }
   }
-  const contractIds = watchedContractIds();
 
-  if (contractIds.length === 0) {
-    lastLedgerSeen = latest.sequence;
+  // Arm the forward poller up front so a scan failure doesn't strand it.
+  lastLedgerSeen = latest.sequence;
+
+  const calls = buildWatchQueryCalls();
+  if (calls.length === 0) {
     log.debug("latestLedger", latest.sequence);
     log.event(
       "cold-start scan skipped — no contracts to watch yet (no councils registered)",
@@ -264,94 +541,31 @@ export async function coldStartScan(
     return;
   }
 
-  // Set the forward cursor up front so a scan failure doesn't strand
-  // the forward poller with a null cursor.
-  lastLedgerSeen = latest.sequence;
-
   log.debug("startLedger", initialStart);
   log.debug("latestLedger", latest.sequence);
-  log.debug("contractCount", contractIds.length);
+  log.debug("callCount", calls.length);
   log.event("cold-start scan starting");
 
   const rawBatch: RawChainEvent[] = [];
-
-  // Walk forward in ledger ranges for each contractIds chunk independently.
-  // Each chunk holds at most CONTRACT_IDS_PER_FILTER contracts; getEvents
-  // pages until a partial page indicates "caught up to head" for that
-  // chunk. The page cap (50) is per-chunk and only fires on pathological
-  // event volume.
-  let totalPages = 0;
-  for (const chunk of chunkContractIds(contractIds)) {
-    let nextLedger = initialStart;
-    let page = 0;
-    while (true) {
-      let res;
-      try {
-        res = await server.getEvents({
-          startLedger: nextLedger,
-          filters: [{ type: "contract", contractIds: chunk }],
-          limit: PAGE_LIMIT,
-        });
-      } catch (err) {
-        // First-page out-of-range failure: retry once at the RPC's valid floor.
-        const floor = page === 0 ? parseValidRangeFloor(err) : null;
-        if (floor !== null && floor > nextLedger) {
-          log.debug("requestedStartLedger", nextLedger);
-          log.debug("retentionFloor", floor);
-          log.event(
-            "cold-start scan startLedger below retention; retrying at floor",
-          );
-          nextLedger = floor;
-          try {
-            res = await server.getEvents({
-              startLedger: nextLedger,
-              filters: [{ type: "contract", contractIds: chunk }],
-              limit: PAGE_LIMIT,
-            });
-          } catch (err2) {
-            log.debug("startLedger", nextLedger);
-            log.error(err2, "cold-start scan retry at retention floor failed");
-            break;
-          }
-        } else {
-          log.debug("page", page);
-          log.debug("startLedger", nextLedger);
-          log.debug("chunkSize", chunk.length);
-          log.error(err, "cold-start scan page failed (stopping chunk)");
-          break;
-        }
-      }
-      page++;
-      totalPages++;
-      for (const ev of res.events) {
-        rawBatch.push({
-          id: ev.id,
-          contractId: ev.contractId?.toString() ?? "",
-          ledger: ev.ledger,
-          topics: ev.topic,
-          value: ev.value,
-          txHash: ev.txHash ?? "",
-          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
-        });
-      }
-      lastLedgerSeen = res.latestLedger;
-      if (res.events.length < PAGE_LIMIT) break;
-      const lastLedgerInPage = res.events[res.events.length - 1].ledger;
-      nextLedger = lastLedgerInPage + 1;
-      if (page >= 50) {
-        log.debug("eventsSoFar", rawBatch.length);
-        log.debug("chunkSize", chunk.length);
-        log.event("cold-start scan hit page cap (50) for chunk; stopping");
-        break;
-      }
+  const advances: (string | null)[] = [];
+  for (const call of calls) {
+    const drained = await drainEvents(
+      { startLedger: initialStart },
+      [call.filter],
+      SCAN_REQUEST_CAP,
+      log.scope(call.label),
+    );
+    rawBatch.push(...drained.raws);
+    advances.push(drained.cursor);
+    if (drained.latestLedger !== null) {
+      lastLedgerSeen = Math.max(lastLedgerSeen, drained.latestLedger);
     }
   }
-  const page = totalPages;
 
   // Process the whole accumulated batch with per-tx dedup, then seed.
   // Back-fill records carry null latency — the store only computes the
-  // avg-latency counter from live observations. Chunked scans return
-  // events grouped per chunk, so re-sort by ledger here to keep the
+  // avg-latency counter from live observations. Per-call drains return
+  // events grouped per call, so re-sort by ledger here to keep the
   // ring-buffer chronological.
   rawBatch.sort((a, b) => a.ledger - b.ledger);
   const chronological = processRawEventBatch(rawBatch, log).map((p) => p.event);
@@ -360,8 +574,19 @@ export async function coldStartScan(
   const newestFirst = [...chronological].reverse();
   networkState.seedRecent(newestFirst);
 
-  log.debug("pagesWalked", page);
+  if (advances.length > 0 && advances.every((c) => c !== null)) {
+    lastCursor = minCursor(advances as string[]);
+  } else {
+    // A call failed before its first page: no gap-free cursor exists, so
+    // the forward poll starts at head (lastLedgerSeen + 1). Loud — the
+    // window between the failed call's coverage and head is lost.
+    log.event(
+      "cold-start drain incomplete; forward poll starts at head (some history may be missing)",
+    );
+  }
+
   log.debug("eventsSeeded", chronological.length);
+  log.debug("lastCursor", lastCursor);
   log.debug("lastLedgerSeen", lastLedgerSeen);
   log.event("cold-start scan complete");
 }
@@ -370,17 +595,18 @@ async function pollTick(
   deps: { log: Logger; bus: NetworkEventBus },
 ): Promise<void> {
   if (!running) return;
-  if (lastLedgerSeen === null) {
-    // Armed but no cursor — cold-start threw (its error is caught + swallowed
-    // in `bootstrap()`) yet the watcher was started. Every tick then no-ops
-    // SILENTLY, freezing the dashboard while `/health` stays green. Make it
-    // loud (rate-limited to ~once/5min at a 5s interval) and observable via
-    // `getWatcherHealth()` so the strand surfaces instead of hiding.
+  if (lastCursor === null && lastLedgerSeen === null) {
+    // Armed but no position — cold-start threw before establishing one
+    // (its error is caught + swallowed in `bootstrap()`) yet the watcher
+    // was started. Every tick then no-ops SILENTLY, freezing the dashboard
+    // while `/health` stays green. Make it loud (rate-limited to
+    // ~once/5min at a 5s interval) and observable via `getWatcherHealth()`
+    // so the strand surfaces instead of hiding.
     strandedTickCount += 1;
     if (strandedTickCount === 1 || strandedTickCount % 60 === 0) {
       deps.log.scope("pollTick").error(
-        new Error("forward poller stranded: lastLedgerSeen === null"),
-        "watcher armed but has no cursor — cold-start did not complete; NO events will be ingested until cold-start succeeds (restart/redeploy)",
+        new Error("forward poller stranded: no cursor and no ledger position"),
+        "watcher armed but has no position — cold-start did not complete; NO events will be ingested until cold-start succeeds (restart/redeploy)",
       );
     }
     return;
@@ -388,78 +614,49 @@ async function pollTick(
   strandedTickCount = 0;
   const log = deps.log.scope("pollTick");
 
-  const contractIds = watchedContractIds();
+  const base: { startLedger: number } | { cursor: string } = lastCursor !== null
+    ? { cursor: lastCursor }
+    : { startLedger: (lastLedgerSeen as number) + 1 };
 
-  // Soroban's getEvents intersects multiple filter entries within a single
-  // call: combining `contractIds: [...]` with a separate topic-only filter
-  // restricts the response to the contractIds — the topic-only filter is
-  // effectively ignored. So we issue two independent calls per tick:
-  //   A) known contracts (the existing behaviour)
-  //   B) network-wide `contract_initialized` for new-council discovery
-  // and merge their result sets.
-  const server = getServer();
-  const startLedger = lastLedgerSeen + 1;
-  let nextLastLedger = lastLedgerSeen;
   const rawBatch: RawChainEvent[] = [];
-  const unknownCandidates = new Set<string>();
-  const knownIds = new Set(contractIds);
+  const advances: (string | null)[] = [];
 
-  // Soroban caps contractIds-per-filter at 5; once the network grows past
-  // that we have to split the known-contracts subscription into multiple
-  // getEvents calls. One call per chunk per tick.
-  for (const chunk of chunkContractIds(contractIds)) {
-    try {
-      const res = await server.getEvents({
-        startLedger,
-        filters: [{ type: "contract", contractIds: chunk }],
-        limit: PAGE_LIMIT,
-      });
-      nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
-      for (const ev of res.events) {
-        rawBatch.push({
-          id: ev.id,
-          contractId: ev.contractId?.toString() ?? "",
-          ledger: ev.ledger,
-          topics: ev.topic,
-          value: ev.value,
-          txHash: ev.txHash ?? "",
-          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
-        });
-      }
-    } catch (err) {
-      log.debug("chunkSize", chunk.length);
-      log.error(err, "Soroban poll (known contracts) failed");
+  // Known-topology subscriptions (councils by contractId, SAC by topic).
+  for (const call of buildWatchQueryCalls()) {
+    const drained = await drainEvents(
+      base,
+      [call.filter],
+      FORWARD_REQUEST_CAP,
+      log.scope(call.label),
+    );
+    rawBatch.push(...drained.raws);
+    advances.push(drained.cursor);
+    if (drained.latestLedger !== null) {
+      lastLedgerSeen = Math.max(lastLedgerSeen ?? 0, drained.latestLedger);
     }
   }
 
-  // Always poll for fresh `contract_initialized` events from contracts
-  // outside the watched set. This is the event-driven new-council
-  // discovery path — the listener no longer gates on a WASM-hash
-  // registry, so local-dev environments without GitHub access for the
-  // soroban-core releases listing still discover new councils as they
-  // deploy.
-  try {
-    const res = await server.getEvents({
-      startLedger,
-      filters: [{
-        type: "contract",
-        topics: [CONTRACT_INITIALIZED_TOPIC_PATTERN],
-      }],
-      limit: PAGE_LIMIT,
-    });
-    nextLastLedger = Math.max(nextLastLedger, res.latestLedger);
-    for (const ev of res.events) {
-      const cid = ev.contractId?.toString() ?? "";
-      if (!cid) continue;
-      // Already-known contracts are handled by the contractIds-filter
-      // call above (which carries full event data); skip the duplicate.
-      if (knownIds.has(cid)) continue;
-      unknownCandidates.add(cid);
-    }
-  } catch (err) {
-    log.error(err, "Soroban poll (contract_initialized) failed");
+  // Network-wide `contract_initialized` poll for new-council discovery —
+  // contracts outside the subscription set feed the adoption pipeline.
+  const discovery = await drainEvents(
+    base,
+    [{ type: "contract", topics: [CONTRACT_INITIALIZED_TOPIC_PATTERN] }],
+    FORWARD_REQUEST_CAP,
+    log.scope("discovery"),
+  );
+  advances.push(discovery.cursor);
+  if (discovery.latestLedger !== null) {
+    lastLedgerSeen = Math.max(lastLedgerSeen ?? 0, discovery.latestLedger);
+  }
+  for (const raw of discovery.raws) {
+    // Already-known councils are handled by the subscription calls above
+    // (which carry full event data); skip the duplicate.
+    if (!raw.contractId) continue;
+    if (networkState.hasCouncil(raw.contractId)) continue;
+    evaluateUnknownContract(raw.contractId, raw.ledger, deps);
   }
 
+  rawBatch.sort((a, b) => a.ledger - b.ledger);
   for (const processed of processRawEventBatch(rawBatch, log)) {
     publishMappedEvent(
       processed.event,
@@ -468,21 +665,25 @@ async function pollTick(
       log,
     );
   }
-  for (const cid of unknownCandidates) {
-    evaluateUnknownContract(cid, startLedger, deps);
-  }
-  // Refresh topology once if there's anything pending, then adopt
-  // (or cache as not-ours) each unknown. On adoption, back-fill from the
-  // earliest observed-at-ledger across the freshly-adopted contracts so
-  // events emitted between deploy and adoption (e.g. provider_added) are
-  // still published live.
+  // Refresh topology if there's anything pending, then adopt (or cache as
+  // not-ours) each unknown. On adoption, back-fill from the earliest
+  // observed-at-ledger across the freshly-adopted contracts so events
+  // emitted between deploy and adoption (e.g. provider_added) are still
+  // published live.
   drainPendingAdoptions({
     ...deps,
     backfillFromLedger,
   }).catch((err) => {
     log.error(err, "drainPendingAdoptions failed");
   });
-  lastLedgerSeen = nextLastLedger;
+
+  // Advance the shared position to the lowest safe cursor across all
+  // calls — never past a call that consumed less, and not at all if any
+  // call failed outright (its events would be skipped). Re-reads on the
+  // faster calls are deduped by event id in the store.
+  if (advances.length > 0 && advances.every((c) => c !== null)) {
+    lastCursor = minCursor(advances as string[]);
+  }
 }
 
 function scheduleNext(deps: { log: Logger; bus: NetworkEventBus }): void {
@@ -497,9 +698,9 @@ function scheduleNext(deps: { log: Logger; bus: NetworkEventBus }): void {
  * Liveness snapshot of the forward poller for `/health`.
  *
  * `running && !armed` is the stranded state (cold-start failed, watcher
- * started with a null cursor) — the poller ingests nothing. Surfacing it lets
- * `/health` report degraded so the strand is caught by monitoring / the Fly
- * health check instead of silently freezing the dashboard for weeks.
+ * started with no forward position) — the poller ingests nothing. Surfacing
+ * it lets `/health` report degraded so the strand is caught by monitoring /
+ * the Fly health check instead of silently freezing the dashboard for weeks.
  */
 export function getWatcherHealth(): {
   running: boolean;
@@ -508,7 +709,7 @@ export function getWatcherHealth(): {
 } {
   return {
     running,
-    armed: lastLedgerSeen !== null,
+    armed: lastCursor !== null || lastLedgerSeen !== null,
     strandedTickCount,
   };
 }
@@ -520,6 +721,7 @@ export function startSorobanWatcher(
   running = true;
   const log = deps.log.scope("sorobanWatcher");
   log.debug("intervalMs", POLL_INTERVAL_MS);
+  log.debug("lastCursor", lastCursor);
   log.debug("lastLedgerSeen", lastLedgerSeen);
   log.event("soroban watcher started");
   scheduleNext(deps);
@@ -534,26 +736,18 @@ export function stopSorobanWatcher(deps: { log: Logger }): void {
   deps.log.scope("sorobanWatcher").event("soroban watcher stopped");
 }
 
-/** Re-anchor the rolling 24h counter window after the hourly re-sync. */
-export async function rescanRollingWindow(
-  deps: { log: Logger; bus: NetworkEventBus },
-): Promise<void> {
-  await coldStartScan(deps);
-}
-
 /**
  * Back-fill scan invoked after a newly-discovered Channel Auth contract is
- * adopted into the topology. Walks the current `watchedContractIds()` set
- * from `fromLedger` forward, maps each event, and publishes via the bus.
+ * adopted into the topology. Walks the current subscription set from
+ * `fromLedger` forward, maps each event, and publishes via the bus.
  * Dedup is handled by `networkState.recordEvent` in `publishMappedEvent` —
  * events the forward poller has already published are skipped, so calling
  * this concurrently with `pollTick` is safe.
  *
- * The scan covers ALL watched contracts (not just the newly-adopted ones)
- * because some events involving a fresh council fire on a SHARED contract
- * — e.g. the XLM SAC `transfer` and `fee` events fan out across every
- * council and need to be mapped via the contract-id linkage that
- * `refreshTopology` just installed.
+ * The scan covers the WHOLE subscription set (not just the newly-adopted
+ * council) because some events involving a fresh council fire on a SHARED
+ * contract — e.g. the XLM SAC `transfer`/`fee` events are matched via the
+ * channel/PP topic patterns that `refreshTopology` just installed.
  */
 export async function backfillFromLedger(
   fromLedger: number,
@@ -563,51 +757,21 @@ export async function backfillFromLedger(
   log.info("backfillFromLedger");
   log.debug("fromLedger", fromLedger);
 
-  const contractIds = watchedContractIds();
-  if (contractIds.length === 0) {
+  const calls = buildWatchQueryCalls();
+  if (calls.length === 0) {
     log.event("back-fill skipped — no contracts watched");
     return;
   }
 
-  const server = getServer();
   const rawBatch: RawChainEvent[] = [];
-  for (const chunk of chunkContractIds(contractIds)) {
-    let nextLedger = fromLedger;
-    let page = 0;
-    while (true) {
-      let res;
-      try {
-        res = await server.getEvents({
-          startLedger: nextLedger,
-          filters: [{ type: "contract", contractIds: chunk }],
-          limit: PAGE_LIMIT,
-        });
-      } catch (err) {
-        log.debug("chunkSize", chunk.length);
-        log.debug("startLedger", nextLedger);
-        log.error(err, "back-fill page failed");
-        break;
-      }
-      page++;
-      for (const ev of res.events) {
-        rawBatch.push({
-          id: ev.id,
-          contractId: ev.contractId?.toString() ?? "",
-          ledger: ev.ledger,
-          topics: ev.topic,
-          value: ev.value,
-          txHash: ev.txHash ?? "",
-          ledgerClosedAtMs: parseLedgerClosedAt(ev.ledgerClosedAt),
-        });
-      }
-      if (res.events.length < PAGE_LIMIT) break;
-      nextLedger = res.events[res.events.length - 1].ledger + 1;
-      if (page >= 50) {
-        log.debug("eventsSoFar", rawBatch.length);
-        log.event("back-fill page cap (50) reached for chunk; stopping");
-        break;
-      }
-    }
+  for (const call of calls) {
+    const drained = await drainEvents(
+      { startLedger: fromLedger },
+      [call.filter],
+      SCAN_REQUEST_CAP,
+      log.scope(call.label),
+    );
+    rawBatch.push(...drained.raws);
   }
 
   rawBatch.sort((a, b) => a.ledger - b.ledger);
@@ -621,4 +785,16 @@ export async function backfillFromLedger(
     );
   }
   log.event("back-fill scan complete");
+}
+
+/** Test-only seams. */
+export function __setServerForTests(server: Server | null): void {
+  rpcServer = server;
+}
+
+export function __resetWatcherStateForTests(): void {
+  lastCursor = null;
+  lastLedgerSeen = null;
+  strandedTickCount = 0;
+  addressTopicCache.clear();
 }

@@ -29,14 +29,25 @@ import type { NetworkEventBus } from "@/core/events/bus.ts";
 
 /**
  * `contract_initialized` fires at deploy time, which precedes the
- * council-platform `PUT /council/metadata` call by some script-controlled
- * window. We keep an unknown contract in `pendingAdoption` and retry
- * topology refresh each poll tick for up to PENDING_TTL_MS so a council
- * registered AFTER its on-chain deploy still gets adopted. Past the TTL we
- * cache as notMoonlight so a chatty unrelated contract can't drag us into
- * repeated topology refreshes forever.
+ * council-platform `PUT /council/metadata` call by some window — script
+ * flows register within seconds, but a HUMAN-driven flow (console/CLI,
+ * the mainnet demo path) can take many minutes. We keep an unknown
+ * contract in `pendingAdoption` for up to PENDING_TTL_MS so a council
+ * registered well after its on-chain deploy still gets adopted (adoption
+ * is what triggers the historical back-fill; the periodic topology
+ * re-sync would surface the council's topology either way, but not its
+ * pre-adoption events). Past the TTL we cache as notMoonlight so an
+ * unrelated contract doesn't stay pending forever. The previous 120s TTL
+ * permanently blacklisted the mainnet demo councils — their platform
+ * registration landed minutes after deploy.
+ *
+ * Refreshes for pending unknowns are throttled to REFRESH_MIN_INTERVAL_MS
+ * (except when a NEW unknown just arrived, which refreshes immediately) so
+ * a chatty unrelated contract costs at most a couple of council-platform
+ * fetches per minute during its pending hour.
  */
-const PENDING_TTL_MS = 120_000;
+const PENDING_TTL_MS = 60 * 60 * 1000;
+const REFRESH_MIN_INTERVAL_MS = 30_000;
 
 interface PendingEntry {
   firstSeenMs: number;
@@ -46,6 +57,9 @@ interface PendingEntry {
 
 const notMoonlight = new Set<string>();
 const pendingAdoption = new Map<string, PendingEntry>();
+/** Set when an unknown was JUST registered — bypasses the refresh throttle. */
+let hasFreshPending = false;
+let lastPendingRefreshMs = 0;
 
 /**
  * Soroban event filter pattern matching `contract_initialized` events with
@@ -87,6 +101,7 @@ export function evaluateUnknownContract(
     firstSeenMs: Date.now(),
     observedAtLedger,
   });
+  hasFreshPending = true;
   log.event("registered unknown contractId for topology adoption");
 }
 
@@ -117,7 +132,17 @@ export async function drainPendingAdoptions(
   log.info("drainPendingAdoptions");
   log.debug("pendingCount", pendingAdoption.size);
 
-  await refreshTopology(`pending=${pendingAdoption.size}`, deps);
+  // Refresh immediately for a brand-new unknown (fast adoption of real
+  // councils); otherwise throttle — the periodic topology re-sync also
+  // updates `networkState`, so waiting pendings still get their
+  // `hasCouncil` check against fresh state below.
+  const refreshNow = hasFreshPending ||
+    Date.now() - lastPendingRefreshMs >= REFRESH_MIN_INTERVAL_MS;
+  if (refreshNow) {
+    hasFreshPending = false;
+    lastPendingRefreshMs = Date.now();
+    await refreshTopology(`pending=${pendingAdoption.size}`, deps);
+  }
 
   const now = Date.now();
   /** Earliest observed ledger across freshly-adopted contracts in this drain pass. */
@@ -162,4 +187,6 @@ export async function drainPendingAdoptions(
 export function __resetForTests(): void {
   notMoonlight.clear();
   pendingAdoption.clear();
+  hasFreshPending = false;
+  lastPendingRefreshMs = 0;
 }

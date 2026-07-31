@@ -10,11 +10,9 @@ import { fetchCouncilTopology } from "./council-fetch.ts";
  *
  * The caller is responsible for any catch-up of historical events for
  * newly-adopted contracts (via `backfillFromLedger` in `soroban-watcher`).
- * We deliberately do NOT call `rescanRollingWindow` here: that helper
- * runs `coldStartScan` which `seedRecent`s the ring buffer with
- * cold-scanned events, and `publishMappedEvent`'s dedup check uses that
- * ring buffer — so a `rescanRollingWindow` call followed by a back-fill
- * would silently dedup every back-filled event before it could reach the
+ * We deliberately do NOT re-run the cold-start scan here: it `seedRecent`s
+ * the ring buffer with cold-scanned events, and `publishMappedEvent`'s
+ * dedup would then skip every back-filled event before it could reach the
  * bus. The contract-init-listener path relies on `backfillFromLedger` to
  * fan out the historical-but-newly-relevant events live.
  *
