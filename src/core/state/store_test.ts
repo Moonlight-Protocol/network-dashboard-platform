@@ -49,6 +49,7 @@ function event(
     councilId,
     councilName: "Council",
     ledger: 1,
+    txHash: "tx-store-test",
     occurredAt: new Date(Date.now() - offsetMs).toISOString(),
     payload,
   };

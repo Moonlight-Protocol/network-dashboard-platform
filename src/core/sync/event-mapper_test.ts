@@ -60,6 +60,7 @@ Deno.test(
     const mapped = mapChainEvent(feeEvent(PP_A));
     assertEquals(mapped?.kind, "channel_bundle");
     assertEquals(mapped?.councilId, COUNCIL_1);
+    assertEquals(mapped?.txHash, "tx-fee-1");
     assertEquals(
       (mapped?.payload as { providerPublicKey: string }).providerPublicKey,
       PP_A,
@@ -190,6 +191,29 @@ Deno.test(
   },
 );
 
+Deno.test(
+  "mapChainEvent carries the raw txHash through to council events (top-level, not payload)",
+  () => {
+    networkState.__resetForTests();
+    const raw: RawChainEvent = {
+      id: "0000000456-0000000001",
+      contractId: COUNCIL_1,
+      ledger: 456,
+      topics: [
+        xdr.ScVal.scvSymbol("provider_added"),
+        Address.fromString(PP_A).toScVal(),
+      ],
+      value: xdr.ScVal.scvVoid(),
+      txHash: "tx-council-1",
+      ledgerClosedAtMs: 1_700_000_000_000,
+    };
+    const mapped = mapChainEvent(raw);
+    assertEquals(mapped?.kind, "provider_added");
+    assertEquals(mapped?.txHash, "tx-council-1");
+    assertEquals("txHash" in (mapped?.payload ?? {}), false);
+  },
+);
+
 // ── SAC transfer amount decoding ─────────────────────────────────────
 //
 // Vectors below are real testnet XLM-SAC events (contract
@@ -266,6 +290,7 @@ Deno.test(
     );
     assertEquals(mapped?.kind, "channel_deposit");
     assertEquals(mapped?.councilId, FELIX_COUNCIL);
+    assertEquals(mapped?.txHash, "tx-transfer-1");
     assertEquals(mapped?.payload.amount, "1000500000");
     assertEquals(mapped?.payload.assetContractId, SAC);
   },

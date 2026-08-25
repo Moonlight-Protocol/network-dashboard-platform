@@ -244,6 +244,7 @@ function makeEvent(
     councilId,
     councilName,
     ledger: raw.ledger,
+    txHash: raw.txHash,
     occurredAt,
     payload,
   };

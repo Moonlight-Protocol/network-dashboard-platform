@@ -10,6 +10,7 @@ function ev(id: string): NetworkEvent {
     councilId: "C",
     councilName: null,
     ledger: 1,
+    txHash: "tx-bus-test",
     occurredAt: new Date(0).toISOString(),
     payload: {},
   };
