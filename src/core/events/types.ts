@@ -33,6 +33,11 @@ export type NetworkEvent = {
   councilId: string;
   councilName: string | null;
   ledger: number;
+  /**
+   * Hash of the transaction that emitted the event. Top-level (not in the
+   * per-kind payloads) so every kind can link out to a chain explorer.
+   */
+  txHash: string;
   occurredAt: string;
   payload: Record<string, unknown>;
 };
@@ -145,5 +150,8 @@ export type ServerFrame = SnapshotFrame | LiveFrame | ErrorFrame;
  * TYPE, not a shape change to an existing frame, so older SPAs simply drop
  * it via `parseServerFrame` rather than mis-rendering — which keeps a
  * platform-first deploy from disconnecting not-yet-updated clients.
+ *
+ * `NetworkEvent.txHash` also does NOT bump the suffix: purely additive
+ * field, older SPAs ignore unknown keys when narrowing frames.
  */
 export const NETWORK_WS_SUBPROTOCOL = "moonlight.network.v2";

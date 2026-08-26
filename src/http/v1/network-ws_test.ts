@@ -78,6 +78,7 @@ function mkEvent(kind: NetworkEvent["kind"]): NetworkEvent {
     councilId: "CCOUNCIL0000000000000000000000000000000000000000000000",
     councilName: "Test Council",
     ledger: evSeq,
+    txHash: "tx-ws-test",
     occurredAt: new Date(0).toISOString(),
     payload: {},
   };

@@ -23,6 +23,7 @@ Deno.test("buildSnapshotFrame collects counters + topology + recent + new surfac
     councilId: "CA",
     councilName: "Alpha",
     ledger: 1,
+    txHash: "tx-snapshot-test",
     occurredAt: new Date(Date.now() - 60_000).toISOString(),
     payload: {},
   });

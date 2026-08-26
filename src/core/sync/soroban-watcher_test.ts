@@ -28,6 +28,7 @@ function providerAddedEvent(
     councilId,
     councilName: "Test Council",
     ledger: 123,
+    txHash: "tx-watcher-test",
     occurredAt: new Date(Date.now() - 100).toISOString(),
     payload: { providerPublicKey: providerPk },
   };
