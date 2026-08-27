@@ -45,7 +45,16 @@ export type NetworkEvent = {
 export type CouncilTopologyEntry = {
   id: string;
   name: string | null;
-  providers: Array<{ publicKey: string; label: string | null }>;
+  providers: Array<{
+    publicKey: string;
+    label: string | null;
+    /**
+     * Self-reported provider base URL from council-platform (nullable —
+     * providers registered before self-reporting send nothing). Additive
+     * field: older SPAs ignore it, no subprotocol bump.
+     */
+    providerUrl?: string | null;
+  }>;
   channels: Array<{
     contractId: string;
     assetCode: string;

@@ -1,6 +1,6 @@
 {
   "name": "@moonlight-protocol/network-dashboard-platform",
-  "version": "0.1.17",
+  "version": "0.1.18",
   "license": "MIT",
   "exports": "./src/main.ts",
   "tasks": {
