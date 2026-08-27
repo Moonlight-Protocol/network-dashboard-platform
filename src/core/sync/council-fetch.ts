@@ -18,7 +18,11 @@ type PublicCouncil = {
     assetCode?: string;
     assetContractId?: string | null;
   }>;
-  providers?: Array<{ publicKey?: string; label?: string | null }>;
+  providers?: Array<{
+    publicKey?: string;
+    label?: string | null;
+    providerUrl?: string | null;
+  }>;
 };
 
 type PublicCouncilsResponse = { data?: PublicCouncil[] };
@@ -68,7 +72,11 @@ export async function fetchCouncilTopology(
         providers: (c.providers ?? [])
           .flatMap((p) =>
             p.publicKey
-              ? [{ publicKey: p.publicKey, label: p.label ?? null }]
+              ? [{
+                publicKey: p.publicKey,
+                label: p.label ?? null,
+                providerUrl: p.providerUrl ?? null,
+              }]
               : []
           ),
         channels: (c.channels ?? [])
